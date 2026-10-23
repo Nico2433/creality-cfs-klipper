@@ -4024,6 +4024,53 @@ _AFC_LANE_KEYS = ("material", "color", "weight", "spool_id", "extruder_temp", "b
                   "map", "runout_lane", "filament_name")
 
 
+SLICER_TAIL_BYTES: int = 512 * 1024   # OrcaSlicer/PrusaSlicer write their settings block at the end
+COLOR_CLOSE_DIST: float = 60.0        # RGB distance under which two colours count as the same
+
+
+def parse_slicer_filaments(text: str) -> list:
+    """The filaments a sliced file asks for, from the slicer's comment block (OrcaSlicer,
+    PrusaSlicer, SuperSlicer): [{"tool": 0, "material": "PLA", "color": "#FFFFFF",
+    "used": True}, ...]. `used` comes from "filament used [g|mm]"; without it every
+    filament counts as used."""
+    found = {}
+    for line in text.splitlines():
+        if not line.startswith(";") or "=" not in line:
+            continue
+        key, _, val = line[1:].partition("=")
+        key, val = key.strip(), val.strip()
+        if key in ("filament_type", "filament_colour", "extruder_colour") or \
+                (key.startswith("filament used [") and key not in found):
+            found[key] = val
+    types = [t.strip() for t in found.get("filament_type", "").split(";")]
+    colors = [c.strip() for c in (found.get("filament_colour")
+                                  or found.get("extruder_colour", "")).split(";")]
+    usage = next((v for k, v in found.items() if k.startswith("filament used [")), None)
+    used = None
+    if usage is not None:
+        try:
+            used = [float(u) > 0 for u in usage.split(",")]
+        except ValueError:
+            used = None
+    out = []
+    for i in range(max(len(types), len(colors)) if found.get("filament_type") else 0):
+        col = colors[i] if i < len(colors) else ""
+        col = "#" + col.lstrip("#")[:6].upper() if len(col.lstrip("#")) >= 6 else None
+        out.append({"tool": i, "material": types[i] if i < len(types) else None, "color": col,
+                    "used": used[i] if used is not None and i < len(used) else used is None})
+    return out
+
+
+def color_distance(a, b) -> float:
+    """Euclidean RGB distance between two '#RRGGBB' colours (inf if either is missing)."""
+    try:
+        ca = [int(a.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+        cb = [int(b.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    except (AttributeError, ValueError):
+        return float("inf")
+    return sum((x - y) ** 2 for x, y in zip(ca, cb)) ** 0.5
+
+
 class _AfcObject:
     """A named Klipper status object whose get_status is a bound callable."""
 
@@ -4057,6 +4104,7 @@ class CFSAfcBridge:
         self.data_file = config.get("lane_data_file", default_file)
         self.extruder_name = config.get("afc_extruder", "extruder")
         self._message = {"message": None, "type": None}
+        self.aliases = {}                 # extra tools sharing a slot (same filament)
         self.lanes = self._load()
         self.printer.add_object("AFC", _AfcObject(self._afc_status))
         self.printer.add_object("AFC_%s %s" % (AFC_UNIT_TYPE, AFC_UNIT_NAME),
@@ -4070,7 +4118,7 @@ class CFSAfcBridge:
         for cmd in ("SET_COLOR", "SET_MATERIAL", "SET_WEIGHT", "SET_SPOOL_ID",
                     "AFC_SET_SPOOL_TEMP", "SET_MAP", "SET_RUNOUT", "CHANGE_TOOL",
                     "TOOL_UNLOAD", "LANE_UNLOAD", "AFC_CLEAR_MESSAGE", "CFS_AUTO_REFILL",
-                    "CFS_LANES"):
+                    "CFS_LANES", "CFS_AUTO_MAP"):
             self.gcode.register_command(cmd, getattr(self, "cmd_" + cmd),
                                         desc=getattr(self, "cmd_%s_help" % cmd))
 
@@ -4089,12 +4137,14 @@ class CFSAfcBridge:
                 for k in _AFC_LANE_KEYS:
                     if k in saved.get(name, {}):
                         lanes[i][k] = saved[name][k]
+            self.aliases = {str(t): int(i) for t, i in saved.get("_aliases", {}).items()}
         except (OSError, ValueError):
             pass
         return lanes
 
     def _save(self) -> None:
         data = {name: self.lanes[i] for i, name in enumerate(self.lane_names)}
+        data["_aliases"] = self.aliases
         tmp = self.data_file + ".tmp"
         try:
             with open(tmp, "w") as f:
@@ -4143,6 +4193,7 @@ class CFSAfcBridge:
             for m in maps:
                 if m:
                     out[str(m).upper()] = idx
+        out.update(self.aliases)
         return out
 
     # ---- status objects ----
@@ -4257,6 +4308,7 @@ class CFSAfcBridge:
         tool = gcmd.get("MAP").strip().upper()
         if not (len(tool) >= 2 and tool[0] == "T" and tool[1:].isdigit()):
             raise gcmd.error("SET_MAP: MAP must be a tool like T0")
+        self.aliases.pop(tool, None)
         old = self.lanes[idx]["map"]
         for other in self.lanes:          # swap with the slot that had this tool (AFC behaviour)
             if other is not self.lanes[idx] and other["map"] == tool:
@@ -4373,6 +4425,117 @@ class CFSAfcBridge:
         self.gcode.run_script_from_command(
             "CFS_TOOL TOOL=%d%s" % (target, " TEMP=%.0f" % temp if temp else ""))
         self.gcode.run_script_from_command("RESUME")
+
+
+    # ---- automatic tool -> slot mapping at print start ----
+    def auto_map(self, filaments: list):
+        """Pick a slot for every used slicer tool: a present slot with the same material,
+        closest colour first (the tool's current slot wins ties). Two tools may share a slot
+        only when they ask for the same filament. Returns ({tool: slot}, warnings, errors)."""
+        current = self.tool_map()
+        pairs = []
+        for f in filaments:
+            if not f["used"] or not f["material"]:
+                continue
+            tool = "T%d" % f["tool"]
+            for idx in range(4):
+                mat = self._material(idx)
+                if self._present(idx) and mat and mat.lower() == f["material"].lower():
+                    dist = color_distance(f["color"], self.lanes[idx]["color"])
+                    pairs.append((dist, current.get(tool) != idx, tool, idx, f))
+        pairs.sort(key=lambda p: p[:2])
+        chosen, owner = {}, {}
+        for dist, _, tool, idx, f in pairs:
+            if tool in chosen:
+                continue
+            other = owner.get(idx)
+            if other is not None and (other["material"].lower(), other["color"]) != \
+                    (f["material"].lower(), f["color"]):
+                continue
+            chosen[tool] = idx
+            owner.setdefault(idx, f)
+        warnings, errors = [], []
+        for f in filaments:
+            tool = "T%d" % f["tool"]
+            if not f["used"] or not f["material"]:
+                continue
+            if tool not in chosen:
+                errors.append("%s (%s %s): no free slot with %s" % (
+                    tool, f["material"], f["color"] or "-", f["material"]))
+            elif color_distance(f["color"], self.lanes[chosen[tool]]["color"]) > COLOR_CLOSE_DIST:
+                warnings.append("%s asks for %s %s but %s has %s" % (
+                    tool, f["material"], f["color"] or "-", self.lane_names[chosen[tool]],
+                    self.lanes[chosen[tool]]["color"] or "no colour set"))
+        return chosen, warnings, errors
+
+    def apply_map(self, chosen: dict) -> None:
+        """Point each tool at its slot (swapping maps like SET_MAP); a second tool that shares
+        a slot goes into the alias table."""
+        self.aliases = {}
+        for tool, idx in sorted(chosen.items(), key=lambda kv: int(kv[0][1:])):
+            if self.tool_map().get(tool) == idx:
+                continue
+            if any(t != tool and chosen.get(t) == idx and self.lanes[idx]["map"] == t
+                   for t in chosen):
+                self.aliases[tool] = idx
+                continue
+            old = self.lanes[idx]["map"]
+            for other in self.lanes:
+                if other is not self.lanes[idx] and other["map"] == tool:
+                    other["map"] = old
+            self.lanes[idx]["map"] = tool
+        self._save()
+
+    def _print_file(self, gcmd):
+        name = gcmd.get("FILE", None)
+        sd = self.printer.lookup_object("virtual_sdcard", None)
+        if name:
+            if sd is not None and not os.path.isabs(name):
+                name = os.path.join(sd.sdcard_dirname, name)
+            return name
+        return sd.file_path() if sd is not None else None
+
+    cmd_CFS_AUTO_MAP_help = ("Map the slicer tools of the print (or FILE=) to the CFS slots by "
+                             "material and colour. [DRY=1] only reports")
+
+    def cmd_CFS_AUTO_MAP(self, gcmd) -> None:
+        path = self._print_file(gcmd)
+        if not path:
+            gcmd.respond_info("CFS: auto-map skipped (no print file)")
+            return
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - SLICER_TAIL_BYTES))
+                text = f.read().decode("utf-8", "replace")
+        except OSError as e:
+            raise gcmd.error("CFS_AUTO_MAP: cannot read %s: %s" % (path, e))
+        filaments = parse_slicer_filaments(text)
+        if not filaments:
+            gcmd.respond_info("CFS: auto-map skipped (no slicer filament data in %s)"
+                              % os.path.basename(path))
+            return
+        try:
+            self.cfs.refresh_slot_presence(0x01)
+        except Exception:
+            logger.exception("creality_cfs: slot presence refresh before auto-map failed")
+        chosen, warnings, errors = self.auto_map(filaments)
+        lines = ["Slicer: " + ", ".join(
+            "T%d %s %s%s" % (f["tool"], f["material"] or "-", f["color"] or "-",
+                             "" if f["used"] else " (unused)") for f in filaments)]
+        lines += ["%s -> %s (%s %s)" % (t, self.lane_names[i], self._material(i),
+                                        self.lanes[i]["color"] or "-")
+                  for t, i in sorted(chosen.items(), key=lambda kv: int(kv[0][1:]))]
+        lines += ["WARNING: " + w for w in warnings] + ["ERROR: " + e for e in errors]
+        gcmd.respond_info("CFS auto-map:\n" + "\n".join(lines))
+        if gcmd.get_int("DRY", 0):
+            return
+        if errors:
+            self._message = {"message": "; ".join(errors), "type": "error"}
+            raise gcmd.error("CFS: missing filament for this print: " + "; ".join(errors))
+        self.apply_map(chosen)
+        self._message = ({"message": "; ".join(warnings), "type": "warning"} if warnings
+                         else {"message": None, "type": None})
 
 
 # ---------------------------------------------------------------------------

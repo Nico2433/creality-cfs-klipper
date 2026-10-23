@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from creality_cfs import CFSAfcBridge
+from creality_cfs import CFSAfcBridge, parse_slicer_filaments
 
 from tests.mock_cfs import MockCFSHardware
 from tests.conftest import make_wired_controller
@@ -207,3 +207,98 @@ class TestPresenceRefresh:
         bridge, cfs, hw, _ = _bridge(tmp_path)
         cfs.refresh_slot_presence(0x01)            # mock answers ch 0x00 with 0x01
         assert [cfs._slots[i]["present"] for i in range(4)] == [True, False, False, False]
+
+
+ORCA_TAIL = """; filament used [mm] = 1200.50, 0.00, 340.10, 15.00
+; filament used [g] = 3.58, 0.00, 1.01, 0.04
+; CONFIG_BLOCK_START
+; filament_colour = #FFFFFF;#00FF00;#000000;#FFFFFF
+; filament_type = PLA;PETG;PLA;PLA
+; CONFIG_BLOCK_END
+"""
+
+
+def _real_slots(bridge):
+    """The user's CFS: slot1 PLA white, slot2 PETG white, slot3 PLA pink, slot4 PLA black."""
+    for idx, (mat, col) in enumerate((("PLA", "#FFFFFF"), ("PETG", "#FFFFFF"),
+                                      ("PLA", "#FFC0CB"), ("PLA", "#000000"))):
+        bridge.lanes[idx]["material"], bridge.lanes[idx]["color"] = mat, col
+
+
+class TestSlicerParse:
+    def test_orca_block(self):
+        f = parse_slicer_filaments(ORCA_TAIL)
+        assert [(x["tool"], x["material"], x["color"], x["used"]) for x in f] == [
+            (0, "PLA", "#FFFFFF", True), (1, "PETG", "#00FF00", False),
+            (2, "PLA", "#000000", True), (3, "PLA", "#FFFFFF", True)]
+
+    def test_alpha_and_no_usage(self):
+        f = parse_slicer_filaments("; filament_colour = #ffc0cbff\n; filament_type = PLA\n")
+        assert f == [{"tool": 0, "material": "PLA", "color": "#FFC0CB", "used": True}]
+
+    def test_no_slicer_data(self):
+        assert parse_slicer_filaments("G1 X1\n; layer 2\n") == []
+
+
+class TestAutoMap:
+    def test_maps_by_material_and_colour(self, tmp_path):
+        bridge, *_ = _bridge(tmp_path)
+        _real_slots(bridge)
+        chosen, warnings, errors = bridge.auto_map(parse_slicer_filaments(ORCA_TAIL))
+        # T0 and T3 both want white PLA: they share slot1; black goes to slot4
+        assert chosen == {"T0": 0, "T2": 3, "T3": 0} and not warnings and not errors
+        bridge.apply_map(chosen)
+        tm = bridge.tool_map()
+        assert (tm["T0"], tm["T2"], tm["T3"]) == (0, 3, 0)
+
+    def test_white_petg_never_used_for_pla(self, tmp_path):
+        bridge, *_ = _bridge(tmp_path, present=(False, True, True, True))
+        _real_slots(bridge)
+        text = "; filament_type = PLA\n; filament_colour = #FFFFFF\n"
+        chosen, warnings, errors = bridge.auto_map(parse_slicer_filaments(text))
+        # closest PLA is pink; PETG white is skipped
+        assert chosen == {"T0": 2} and warnings and not errors
+
+    def test_missing_material_is_an_error(self, tmp_path):
+        bridge, cfs, *_ = _bridge(tmp_path)
+        cfs.refresh_slot_presence = lambda addr: None
+        _real_slots(bridge)
+        path = tmp_path / "x.gcode"
+        path.write_text("; filament_type = ABS\n; filament_colour = #FF0000\n")
+        with pytest.raises(Exception, match="ABS"):
+            bridge.cmd_CFS_AUTO_MAP(_gcmd(FILE=str(path)))
+        assert bridge._afc_status(0)["message"]["type"] == "error"
+
+    def test_dry_run_changes_nothing(self, tmp_path):
+        bridge, cfs, *_ = _bridge(tmp_path)
+        cfs.refresh_slot_presence = lambda addr: None
+        _real_slots(bridge)
+        path = tmp_path / "x.gcode"
+        path.write_text("; filament_type = PLA\n; filament_colour = #000000\n")
+        bridge.cmd_CFS_AUTO_MAP(_gcmd(FILE=str(path), DRY="1"))
+        assert bridge.tool_map()["T0"] == 0
+        bridge.cmd_CFS_AUTO_MAP(_gcmd(FILE=str(path)))
+        assert bridge.tool_map()["T0"] == 3
+
+    def test_distinct_filaments_get_distinct_slots(self, tmp_path):
+        bridge, *_ = _bridge(tmp_path)
+        _real_slots(bridge)
+        text = "; filament_type = PLA;PLA\n; filament_colour = #FFFFFF;#F0F0F0\n"
+        chosen, warnings, errors = bridge.auto_map(parse_slicer_filaments(text))
+        assert chosen["T0"] == 0 and chosen["T1"] != 0
+
+    def test_aliases_persist_and_set_map_clears(self, tmp_path):
+        bridge, cfs, hw, data_file = _bridge(tmp_path)
+        _real_slots(bridge)
+        bridge.apply_map({"T0": 0, "T3": 0})
+        assert json.load(open(data_file))["_aliases"] == {"T3": 0}
+        bridge2 = CFSAfcBridge(cfs, _cfg(data_file))
+        assert bridge2.tool_map()["T3"] == 0
+        bridge2.cmd_SET_MAP(_gcmd(LANE="slot2", MAP="T3"))
+        assert bridge2.tool_map()["T3"] == 1
+
+
+def _cfg(data_file):
+    config = mock.MagicMock()
+    config.get.side_effect = lambda k, d=None: {"lane_data_file": data_file}.get(k, d)
+    return config
