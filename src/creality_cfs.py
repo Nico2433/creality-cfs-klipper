@@ -1042,6 +1042,13 @@ class CrealityCFS:
         # CFS_CUT checks the switch reads PRESSED at the cut position (stock confirms every
         # cut this way) and raises a recoverable error after backing off if it does not.
         self.cut_switch_button = config.get("cut_switch_button", None)
+        # heartbeat_interval: seconds between idle GET_BOX_STATE (0x0A) polls of every online
+        # box; 0 disables. The K1 Max stock host polls every ~4 s, and without it the box's
+        # front LEDs blink red as if no host were attached. Skipped while a command holds
+        # the bus.
+        self.heartbeat_interval: float = config.getfloat(
+            "heartbeat_interval", 0., minval=0., maxval=60.)
+        self._heartbeat_timer = None
         # The requested baud is mapped to a termios B-constant lazily in the connect path
         # (_resolve_baud_const, called from _config_tty). It is NOT resolved here because
         # termios does not exist off-POSIX and __init__ must construct on any host (the
@@ -1206,6 +1213,24 @@ class CrealityCFS:
 
         if self.auto_init:
             self.reactor.register_callback(self._auto_init_callback)
+        if self.heartbeat_interval > 0. and self._heartbeat_timer is None:
+            self._heartbeat_timer = self.reactor.register_timer(
+                self._heartbeat, self.reactor.monotonic() + self.heartbeat_interval)
+
+    def _heartbeat(self, eventtime: float) -> float:
+        """Idle keep-alive: one GET_BOX_STATE per online box (stock K1 host cadence).
+        Never contends with a running command: if the bus is held, wait for the next tick."""
+        if self._shutdown:
+            return self.reactor.NEVER
+        if self.is_connected and not self._bus_lock.test():
+            for entry in self._box_table:
+                if entry.online == BoxAddressEntry.ONLINE_ONLINE:
+                    try:
+                        self.get_box_state(entry.addr, retries=1)
+                    except Exception:
+                        logger.exception("creality_cfs: heartbeat poll failed (addr 0x%02X)",
+                                         entry.addr)
+        return eventtime + self.heartbeat_interval
 
     def _auto_init_callback(self, eventtime: float) -> None:
         """Reactor callback to run auto-addressing on klippy:ready.

@@ -198,3 +198,32 @@ class TestFeederAndBufferCommands:
             cfs.cmd_CFS_FEEDER(_gcmd(ints={"ENABLE": 1}))
         with pytest.raises(Exception, match="not connected"):
             cfs.cmd_CFS_BUFFER(_gcmd())
+
+
+class TestHeartbeat:
+    def test_off_by_default(self):
+        cfs, hw = _wired()
+        assert cfs.heartbeat_interval == 0.
+
+    def test_polls_online_box_when_bus_free(self):
+        cfs, hw = _wired()
+        cfs.heartbeat_interval = 4.
+        cfs._bus_lock.test.return_value = False
+        before = hw.get_received_funcs().count(0x0A)
+        nxt = cfs._heartbeat(100.0)
+        assert nxt == 104.0
+        assert hw.get_received_funcs().count(0x0A) == before + 1
+
+    def test_skips_while_bus_busy(self):
+        cfs, hw = _wired()
+        cfs.heartbeat_interval = 4.
+        cfs._bus_lock.test.return_value = True
+        before = len(hw.get_received_funcs())
+        assert cfs._heartbeat(100.0) == 104.0
+        assert len(hw.get_received_funcs()) == before
+
+    def test_stops_after_shutdown(self):
+        cfs, hw = _wired()
+        cfs.heartbeat_interval = 4.
+        cfs._shutdown = True
+        assert cfs._heartbeat(100.0) is cfs.reactor.NEVER
