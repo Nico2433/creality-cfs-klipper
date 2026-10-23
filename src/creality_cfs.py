@@ -4360,6 +4360,11 @@ class CFSAfcBridge:
                               "CFS_TOOL TOOL=<0-3> (or CHANGE_TOOL LANE=<slotN>), then RESUME."
                               % self.lane_names[src])
             return
+        # The slicer keeps sending the run-out slot's tool: move that tool to the refill slot
+        # (swap, as AFC does) so the next T<n> stays on the slot that now feeds the print.
+        self.lanes[src]["map"], self.lanes[target]["map"] = (
+            self.lanes[target]["map"], self.lanes[src]["map"])
+        self._save()
         self._message = {"message": "%s ran out; continued with %s"
                          % (self.lane_names[src], self.lane_names[target]), "type": "info"}
         gcmd.respond_info("CFS: %s ran out, continuing with %s"

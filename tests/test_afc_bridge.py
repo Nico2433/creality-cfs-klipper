@@ -166,6 +166,8 @@ class TestRefill:
         bridge.lanes[2]["extruder_temp"] = 215.0
         bridge.cmd_CFS_AUTO_REFILL(_gcmd(FROM="0"))
         assert _scripts(cfs) == ["CFS_TOOL TOOL=2 TEMP=215", "RESUME"]
+        # T0 now points at the refill slot, so the slicer's next T0 stays on slot3
+        assert bridge.tool_map()["T0"] == 2 and bridge.lanes[0]["map"] == "T2"
 
     def test_auto_refill_without_target_stays_paused(self, tmp_path):
         bridge, cfs, *_ = _bridge(tmp_path)
