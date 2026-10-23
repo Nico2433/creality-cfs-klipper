@@ -668,6 +668,8 @@ LOADER_WAKE_DELAY_S: float = 1.0
 # Consecutive silent heartbeats before the box is re-addressed and connect-inited again
 # (box power-cycled or replugged while Klipper kept running).
 HEARTBEAT_LOST_REINIT: int = 3
+# Plausible box temperatures in the 0x0A idle reply; anything else is not an env reading.
+BOX_ENV_TEMP_RANGE: tuple = (0, 80)
 
 # ---------------------------------------------------------------------------
 # Per-command timeouts
@@ -1070,6 +1072,8 @@ class CrealityCFS:
         self._presence_every = 4            # heartbeat ticks between slot-presence refreshes
         self._heartbeat_count = 0
         self._heartbeat_misses = 0
+        # (temperature, humidity) per box address from the idle 0x0A replies.
+        self._box_env: dict = {}
         # The requested baud is mapped to a termios B-constant lazily in the connect path
         # (_resolve_baud_const, called from _config_tty). It is NOT resolved here because
         # termios does not exist off-POSIX and __init__ must construct on any host (the
@@ -1218,6 +1222,11 @@ class CrealityCFS:
         if self.printer.lookup_object("box", None) is None:
             self.printer.add_object("box", CFSBoxStatus(self))
         self.afc = CFSAfcBridge(self, config) if config.getboolean("afc_compat", False) else None
+        # box_sensor: publish box 1's temperature/humidity as `temperature_sensor <name>`
+        # (Fluidd lists it with its chart and shows the humidity under the temperature).
+        sensor_name = config.get("box_sensor", None)
+        if sensor_name:
+            CFSBoxSensor(self, config, sensor_name)
 
         logger.info("creality_cfs: module loaded, port=%s baud=%d", self.serial_port, self.baud)
 
@@ -2106,9 +2115,9 @@ class CrealityCFS:
         Response decode (wire-corrected 2026-06-20, CRC-verified across two boxes; the old
         [hi=0x1a class byte][lo 0x20=LOADED/0x1f=FEEDING] model is WIRE-DISPROVEN):
           RSP: f7 [addr] 07 [STATUS] 0a [b0][b1][b2][b3] [crc]
-          - b0/b1: OPAQUE firmware base (0x1a20/0x1b26/0x1c24/0x1d21 all observed on identical
-            hardware). Carries NO load information -- gating on it caused the reference
-            stack's dry-purge bug. Exposed as fw_base for diagnostics only.
+          - b0/b1: box temperature (deg C) and relative humidity (%) on an idle (STATUS 0x00)
+            reply -- K1 Max stock trace 0x14 0x3f while stock showed humidity 63. That is
+            why the "firmware base" drifted between reads. Carries NO load information.
           - b2: substatus (0x00 = OK).
           - b3: the REAL load flag: 0x02 = loaded/print-locked, 0x00 = feed/change mode.
           - the frame STATUS byte is the async EVENT channel: 0x00 idle, 0x30 insert push
@@ -2167,6 +2176,9 @@ class CrealityCFS:
         # Fault dispatch (buffer spec 2026-07-19): the box raises its OWN feed-loop faults
         # as abnormal STATUS bytes on the 0x0A reply; route them to the status sink.
         self._note_box_status(addr, status, data_bytes)
+        if status == 0x00 and BOX_ENV_TEMP_RANGE[0] <= d[0] <= BOX_ENV_TEMP_RANGE[1] \
+                and d[1] <= 100:
+            self._box_env[addr] = (float(d[0]), float(d[1]))
         logger.debug("creality_cfs: GET_BOX_STATE addr=0x%02X raw=%s loaded=%s event=0x%02X",
                      addr, data_bytes.hex(), result["loaded"],
                      status if status is not None else 0xFF)
@@ -3268,6 +3280,8 @@ class CrealityCFS:
             "buffer_code": self._buffer_state,
             "buffer": (BUFFER_STATE_NAMES.get(self._buffer_state, "unknown")
                        if self._buffer_state is not None else "unknown"),
+            "box_env": {"box%d" % a: {"temperature": t, "humidity": h}
+                        for a, (t, h) in self._box_env.items()},
         }
 
     # -----------------------------------------------------------------------
@@ -3291,6 +3305,7 @@ class CrealityCFS:
         """
         entry = self._box_table[tn_index] if tn_index < len(self._box_table) else None
         connected = bool(entry and entry.online == BoxAddressEntry.ONLINE_ONLINE)
+        env = self._box_env.get(entry.addr) if entry else None
         remain_len = [0, 0, 0, 0]
         material_type = ["", "", "", ""]
         any_present = 0
@@ -3308,8 +3323,8 @@ class CrealityCFS:
         return {
             "state": "connect" if connected else "disconnect",
             "filament": any_present,
-            "temperature": 0,
-            "dry_and_humidity": 0,
+            "temperature": int(env[0]) if env else 0,
+            "dry_and_humidity": int(env[1]) if env else 0,
             "filament_detected": any_present,
             "measuring_wheel": 0,
             "version": "",
@@ -4070,6 +4085,46 @@ class CFSBoxStatus:
 
     def get_status(self, eventtime) -> dict:
         return self._cfs._flat_box_status()
+
+
+class CFSBoxSensor:
+    """Box 1's temperature and humidity (from the 0x0A heartbeat) as the Klipper object
+    `temperature_sensor <name>`, without a config section of its own. Listed in
+    heaters.available_sensors so Moonraker keeps its history for the UI charts."""
+
+    def __init__(self, cfs, config, name: str) -> None:
+        self._cfs = cfs
+        self.name = name
+        self._min = None
+        self._max = None
+        printer = config.get_printer()
+        printer.add_object("temperature_sensor " + name, self)
+        pheaters = printer.load_object(config, "heaters")
+        pheaters.available_sensors.append("temperature_sensor " + name)
+
+    def _env(self):
+        return self._cfs._box_env.get(0x01)
+
+    def get_temp(self, eventtime):
+        env = self._env()
+        return (env[0] if env else 0.), 0.
+
+    def stats(self, eventtime):
+        env = self._env()
+        if not env:
+            return False, "%s: no data" % self.name
+        return False, "%s: temp=%.0f humidity=%.0f" % (self.name, env[0], env[1])
+
+    def get_status(self, eventtime) -> dict:
+        env = self._env()
+        if not env:
+            return {"temperature": None, "humidity": None,
+                    "measured_min_temp": None, "measured_max_temp": None}
+        t, h = env
+        self._min = t if self._min is None else min(self._min, t)
+        self._max = t if self._max is None else max(self._max, t)
+        return {"temperature": t, "humidity": h,
+                "measured_min_temp": self._min, "measured_max_temp": self._max}
 
 
 # ---------------------------------------------------------------------------
