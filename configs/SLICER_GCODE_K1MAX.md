@@ -11,8 +11,13 @@ Parameters `START_PRINT` reads:
 |---|---|
 | `EXTRUDER_TEMP` | nozzle temperature (also the first load) |
 | `BED_TEMP` | bed temperature |
-| `CHAMBER_TEMP` | exhaust fan target; side fan while heating if the chamber is colder. 0 = leave as is |
+| `CHAMBER_TEMP` | chamber target (`M141`): the exhaust fan runs above it; side fan while heating if colder. 0 = default |
+| `CHAMBER_MIN` | minimal chamber temperature (`M191`): wait for it after the bed is stable, before the Eddy tap. 0 = no wait |
 | `INITIAL_TOOL` | slicer tool loaded before the line purge (slot from the Fluidd tool map / auto-map) |
+
+`M141 S<t>` / `M191 S<t>` follow the usual Klipper/Marlin meaning (set target / set and wait) and
+replace SimpleAF's versions; `S0` puts the exhaust target back to its default (35 C). An `M191`
+sent before `START_PRINT`, while the bed is still cold, is remembered and waited for inside it.
 
 Per colour change, `T<n>` reads two optional values set just before it:
 `_CFS_SETTINGS next_temp` (new filament temperature) and `next_purge` (mm purged at the chute;
@@ -25,10 +30,11 @@ Printer settings → Machine G-code.
 Machine start G-code:
 
 ```
-START_PRINT EXTRUDER_TEMP=[nozzle_temperature_initial_layer] BED_TEMP=[bed_temperature_initial_layer_single] CHAMBER_TEMP=[chamber_temperature] INITIAL_TOOL=[initial_no_support_extruder]
+START_PRINT EXTRUDER_TEMP=[nozzle_temperature_initial_layer] BED_TEMP=[bed_temperature_initial_layer_single] CHAMBER_TEMP=[chamber_temperature] CHAMBER_MIN=[chamber_minimal_temperature[initial_no_support_extruder]] INITIAL_TOOL=[initial_no_support_extruder]
 ```
 
-Orca adds `G90`, `G21`, `M83`, the first `T` and `G92 E0` after it by itself.
+Chamber values come from the filament settings (Cooling → Chamber temperature: target and
+minimal). Leave "Activate temperature control" off: START_PRINT handles it. Orca adds `G90`, `G21`, `M83`, the first `T` and `G92 E0` after it by itself.
 
 Machine end G-code:
 
@@ -49,7 +55,9 @@ purges more than black→white. With the prime tower on, the tower purges as wel
 
 ## Creality Print (6.x / 7.x)
 
-Same placeholders as Orca (it is an Orca fork). Machine start G-code:
+Same placeholders as Orca (it is an Orca fork), but it has only a chamber target (no minimal).
+It sends `M141 S<target>` before the start G-code and `M141 S0` at the end by itself; both work
+with the macros above. Machine start G-code:
 
 ```
 START_PRINT EXTRUDER_TEMP=[nozzle_temperature_initial_layer] BED_TEMP=[bed_temperature_initial_layer_single] CHAMBER_TEMP=[chamber_temperature] INITIAL_TOOL=[initial_no_support_extruder]
@@ -65,8 +73,11 @@ Printer settings → General: Extruders 4, "Single Extruder Multi Material" on.
 Custom G-code → Start G-code:
 
 ```
-START_PRINT EXTRUDER_TEMP=[first_layer_temperature[initial_tool]] BED_TEMP=[first_layer_bed_temperature[initial_tool]] CHAMBER_TEMP=[chamber_temperature[initial_tool]] INITIAL_TOOL=[initial_tool]
+START_PRINT EXTRUDER_TEMP=[first_layer_temperature[initial_tool]] BED_TEMP=[first_layer_bed_temperature[initial_tool]] CHAMBER_TEMP=[chamber_temperature[initial_tool]] CHAMBER_MIN=[chamber_minimal_temperature[initial_tool]] INITIAL_TOOL=[initial_tool]
 ```
+
+PrusaSlicer names the chamber settings like Orca (filament: Chamber temperature / Minimal
+chamber temperature). Using them in the start G-code keeps it from adding its own M141/M191.
 
 End G-code `END_PRINT`. Tool change G-code:
 
