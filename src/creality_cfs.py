@@ -4061,6 +4061,13 @@ def parse_slicer_filaments(text: str) -> list:
     return out
 
 
+def materials_match(a, b) -> bool:
+    """Material names match ignoring case, spaces and '+' ("PLA+" == "PLA"); "PLA-CF" stays
+    distinct from "PLA"."""
+    norm = lambda m: "".join(c for c in (m or "").upper() if c not in "+ ")
+    return bool(a and b) and norm(a) == norm(b)
+
+
 def color_distance(a, b) -> float:
     """Euclidean RGB distance between two '#RRGGBB' colours (inf if either is missing)."""
     try:
@@ -4392,7 +4399,7 @@ class CFSAfcBridge:
             if cand == idx or not self._present(cand):
                 continue
             cmat, ccol = self._material(cand), self.lanes[cand]["color"]
-            if cmat and ccol and cmat.lower() == mat.lower() and ccol.lower() == col.lower():
+            if ccol and materials_match(cmat, mat) and ccol.lower() == col.lower():
                 return cand
         return None
 
@@ -4440,7 +4447,7 @@ class CFSAfcBridge:
             tool = "T%d" % f["tool"]
             for idx in range(4):
                 mat = self._material(idx)
-                if self._present(idx) and mat and mat.lower() == f["material"].lower():
+                if self._present(idx) and materials_match(mat, f["material"]):
                     dist = color_distance(f["color"], self.lanes[idx]["color"])
                     pairs.append((dist, current.get(tool) != idx, tool, idx, f))
         pairs.sort(key=lambda p: p[:2])
@@ -4449,8 +4456,8 @@ class CFSAfcBridge:
             if tool in chosen:
                 continue
             other = owner.get(idx)
-            if other is not None and (other["material"].lower(), other["color"]) != \
-                    (f["material"].lower(), f["color"]):
+            if other is not None and not (materials_match(other["material"], f["material"])
+                                          and other["color"] == f["color"]):
                 continue
             chosen[tool] = idx
             owner.setdefault(idx, f)

@@ -302,3 +302,18 @@ def _cfg(data_file):
     config = mock.MagicMock()
     config.get.side_effect = lambda k, d=None: {"lane_data_file": data_file}.get(k, d)
     return config
+
+
+class TestMaterialNames:
+    def test_plus_variant_matches(self, tmp_path):
+        bridge, *_ = _bridge(tmp_path)
+        _real_slots(bridge)
+        text = "; filament_type = PLA+\n; filament_colour = #FFFFFF\n"
+        chosen, warnings, errors = bridge.auto_map(parse_slicer_filaments(text))
+        assert chosen == {"T0": 0} and not warnings and not errors
+
+    def test_cf_is_a_different_material(self, tmp_path):
+        bridge, *_ = _bridge(tmp_path)
+        _real_slots(bridge)
+        text = "; filament_type = PLA-CF\n; filament_colour = #000000\n"
+        assert bridge.auto_map(parse_slicer_filaments(text))[2]
