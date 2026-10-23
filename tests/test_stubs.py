@@ -75,6 +75,7 @@ def make_cfs_with_mock_send(send_return=None):
     # Choreography attributes normally set from config in __init__:
     instance.load_wall_budget = 90.0
     instance.load_max_bursts = LOAD_TOPUP_MAX_BURSTS
+    instance.load_finalize = True
     instance.filament_sensor_name = "filament_sensor"
     # Bare printer with no optional objects (no toolhead filament switch).
     printer = MagicMock()

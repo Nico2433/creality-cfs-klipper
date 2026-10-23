@@ -587,6 +587,7 @@ RETRUDE_SENSOR_POLL_DT_S: float = 0.25
 RETRUDE_WALL_BUDGET_S: float = 60.0     # hard wall-clock budget for the whole unload
 RETRUDE_TOOLHEAD_PULL_MM: float = 15.0
 RETRUDE_TOOLHEAD_PULL_VEL: float = 360.0
+CUT_SWITCH_SETTLE_S: float = 0.15   # dwell after the cut ram before reading the switch
 
 # ---------------------------------------------------------------------------
 # 0x0D SET_PRE_LOADING payload = [mask][phase] (generalized per the 2026-06-20 decode)
@@ -1021,6 +1022,26 @@ class CrealityCFS:
         # nozzle_clean_macro: an optional [gcode_macro] name run once per flush cycle (the
         # per-cycle nozzle wipe). Printer-specific wipe geometry belongs in that macro.
         self.nozzle_clean_macro = config.get("nozzle_clean_macro", None)
+        # K1-family stock parity. Defaults keep the Hi-validated behaviour; the K1 Max stock
+        # values (from its wire logs and box.cfg) are noted per option.
+        # load_finalize: send the 0x10 [slot][07][03] finalize after the settle stage. The
+        # K1 Max stock host never sends it (21 logged loads: stages 00/04/05/06 only).
+        self.load_finalize: bool = config.getboolean("load_finalize", True)
+        # release_feeder_after_load: send 0x0F 00 at the end of a load. The K1 Max stock host
+        # keeps the feeder engaged for the whole print (0x0F 01 at start, 0x0F 00 at the end;
+        # see CFS_FEEDER).
+        self.release_feeder_after_load: bool = config.getboolean(
+            "release_feeder_after_load", True)
+        # retrude_pull_len / retrude_pull_velocity: the single toolhead pull between the
+        # unload's START and FINISH frames. K1 Max stock box.cfg: Tn_retrude -20.
+        self.retrude_pull_len: float = config.getfloat(
+            "retrude_pull_len", RETRUDE_TOOLHEAD_PULL_MM, above=0., maxval=50.)
+        self.retrude_pull_velocity: float = config.getfloat(
+            "retrude_pull_velocity", RETRUDE_TOOLHEAD_PULL_VEL, above=0.)
+        # cut_switch_button: name of a [gcode_button] wired to the cutter switch. When set,
+        # CFS_CUT checks the switch reads PRESSED at the cut position (stock confirms every
+        # cut this way) and raises a recoverable error after backing off if it does not.
+        self.cut_switch_button = config.get("cut_switch_button", None)
         # The requested baud is mapped to a termios B-constant lazily in the connect path
         # (_resolve_baud_const, called from _config_tty). It is NOT resolved here because
         # termios does not exist off-POSIX and __init__ must construct on any host (the
@@ -1121,6 +1142,16 @@ class CrealityCFS:
             "CFS_FLUSH",
             self.cmd_CFS_FLUSH,
             desc=self.cmd_CFS_FLUSH_help,
+        )
+        self.gcode.register_command(
+            "CFS_FEEDER",
+            self.cmd_CFS_FEEDER,
+            desc=self.cmd_CFS_FEEDER_help,
+        )
+        self.gcode.register_command(
+            "CFS_BUFFER",
+            self.cmd_CFS_BUFFER,
+            desc=self.cmd_CFS_BUFFER_help,
         )
         # Stock BOX_* tokens for the box-parity features (auto-refill / same-material /
         # error clear). Named to match the stock box_wrapper G-code surface so UIs and
@@ -2507,8 +2538,9 @@ class CrealityCFS:
         if switched and deadline_fn() > 0:
             self.extrude_stage(addr, slot, EXTRUDE_SUB_SETTLE, 0x00,
                                timeout=min(EXTRUDE_STAGE_TIMEOUT_S, max(0.0, deadline_fn())))
-            self.extrude_stage(addr, slot, EXTRUDE_SUB_FINALIZE, EXTRUDE_FINALIZE_DATA,
-                               timeout=min(EXTRUDE_STAGE_TIMEOUT_S, max(0.0, deadline_fn())))
+            if self.load_finalize:
+                self.extrude_stage(addr, slot, EXTRUDE_SUB_FINALIZE, EXTRUDE_FINALIZE_DATA,
+                                   timeout=min(EXTRUDE_STAGE_TIMEOUT_S, max(0.0, deadline_fn())))
         return switched
 
     def extrude_process(self, addr: int, slot: int = SLOT_T1) -> dict:
@@ -2852,12 +2884,30 @@ class CrealityCFS:
             pass
         self.gcode.run_script_from_command("M83")
         self.gcode.run_script_from_command(
-            "G1 E-%.3f F%.0f" % (RETRUDE_TOOLHEAD_PULL_MM, RETRUDE_TOOLHEAD_PULL_VEL))
+            "G1 E-%.3f F%.0f" % (self.retrude_pull_len, self.retrude_pull_velocity))
 
     def _dwell(self, seconds: float) -> None:
         """In-handler pacing dwell (G4). Stays inside the gcode context and lets the
         reactor service the serial fd between polls."""
         self.gcode.run_script_from_command("G4 P%d" % int(max(0.0, seconds) * 1000))
+
+    def _cut_switch_pressed(self):
+        """Cutter switch state at the end of the cut ram: True/False, or None when no
+        cut_switch_button is configured (or the button object is missing). Waits for the
+        ram to finish (M400) plus a short dwell so the MCU button report has landed."""
+        if not self.cut_switch_button:
+            return None
+        obj = self.printer.lookup_object("gcode_button " + self.cut_switch_button, None)
+        if obj is None:
+            logger.warning("creality_cfs: cut_switch_button %r not found; cut unconfirmed",
+                           self.cut_switch_button)
+            return None
+        self.gcode.run_script_from_command("M400")
+        self._dwell(CUT_SWITCH_SETTLE_S)
+        try:
+            return obj.get_status(self.reactor.monotonic()).get("state") == "PRESSED"
+        except Exception:
+            return None
 
     def load_process(self, gcmd, addr: int, slot: int) -> None:
         """The FULL validated load choreography (CFS_EXTRUDE):
@@ -2907,20 +2957,22 @@ class CrealityCFS:
             gcmd.respond_info("CFS_EXTRUDE: post-load buffer reads %s (stock expects "
                               "middle) -- informational." % buf["state"])
         self.set_print_mode(addr, slot)                # 0x04 [slot][00]
-        self.ctrl_connection_motor_action(addr, False)  # 0x0F 00 release
+        if self.release_feeder_after_load:
+            self.ctrl_connection_motor_action(addr, False)  # 0x0F 00 release
         try:
             self._active_tool = SLOT_BITMASKS.index(slot)
         except ValueError:
             self._active_tool = None
+        feeder = "released" if self.release_feeder_after_load else "kept engaged"
         if have_sensor:
             gcmd.respond_info(
                 "CFS_EXTRUDE: filament reached the toolhead (switch tripped) after %d ramp "
-                "cycle(s); print mode set, feeder released." % result['cycles'])
+                "cycle(s); print mode set, feeder %s." % (result['cycles'], feeder))
         else:
             gcmd.respond_info(
                 "CFS_EXTRUDE: ran %d ungated ramp cycle (no toolhead filament switch "
-                "configured -- cannot confirm arrival); print mode set, feeder released."
-                % result['cycles'])
+                "configured -- cannot confirm arrival); print mode set, feeder %s."
+                % (result['cycles'], feeder))
 
     def unload_process(self, gcmd, addr: int, slot: int) -> None:
         """The FULL validated unload choreography (CFS_RETRUDE):
@@ -3654,13 +3706,24 @@ class CrealityCFS:
             gcmd.respond_info("CFS_CUT: X-axis ram (%.2f,%.2f) -> X%.2f at F%.0f, switch=%s"
                               % (pre_x, pre_y, cut_x, fr, self.cut_switch_pin))
             self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (cut_x, fr))
-            self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (pre_x, fr))
         else:
             gcmd.respond_info("CFS_CUT: Y-axis ram (%.2f,%.2f) -> Y%.2f at F%.0f, switch=%s"
                               % (pre_x, pre_y, cut_y, fr, self.cut_switch_pin))
             self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (cut_y, fr))
+        switch_pressed = self._cut_switch_pressed()
+        if cut_x is not None:
+            self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (pre_x, fr))
+        else:
             self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (pre_y, fr))
         self.gcode.run_script_from_command("M400")
+        if switch_pressed is False:
+            self._cut_state = False
+            raise gcmd.error(
+                "CFS_CUT: the cutter switch [gcode_button %s] did not read PRESSED at the cut "
+                "position -- the filament may not be cut. Check the cutter lever and the cut "
+                "position, then retry." % self.cut_switch_button)
+        if switch_pressed:
+            gcmd.respond_info("CFS_CUT: cutter switch PRESSED at the cut position.")
         # Post-cut 0x05 read, RE-PINNED 2026-07-19: the byte is the BUFFER state, not a cut
         # confirmation (the bus has no cut-result read; stock confirms the cut via the
         # toolhead cutter switch). The 2026-06-22 stock-vs-empty observations hold under
@@ -3771,6 +3834,37 @@ class CrealityCFS:
         self.gcode.run_script_from_command("G90")
         gcmd.respond_info("CFS_FLUSH: complete (%.2f mm purged in %d cycles)."
                           % (total, len(cycles)))
+
+    cmd_CFS_FEEDER_help: str = (
+        "Engage (ENABLE=1) or release (ENABLE=0) the CFS feeder motor (0x0F). The K1 Max "
+        "stock host engages it at print start and releases it at the end. [BOX=<1-4>]"
+    )
+
+    def cmd_CFS_FEEDER(self, gcmd) -> None:
+        """G-code: CFS_FEEDER ENABLE=<0|1> [BOX=<1-4>] -- 0x0F engage/release."""
+        if not self.is_connected:
+            raise gcmd.error("CFS serial port is not connected")
+        addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
+        enable = gcmd.get_int("ENABLE", minval=0, maxval=1)
+        ok = self.ctrl_connection_motor_action(addr, bool(enable))
+        gcmd.respond_info("CFS_FEEDER: box %d feeder %s%s" % (
+            addr, "engaged" if enable else "released", "" if ok else " (no ACK)"))
+
+    cmd_CFS_BUFFER_help: str = (
+        "Read the filament buffer position from the CFS (0x05): middle/full/empty. "
+        "[BOX=<1-4>]"
+    )
+
+    def cmd_CFS_BUFFER(self, gcmd) -> None:
+        """G-code: CFS_BUFFER [BOX=<1-4>] -- one 0x05 read, reported to the console."""
+        if not self.is_connected:
+            raise gcmd.error("CFS serial port is not connected")
+        addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
+        buf = self.get_buffer_state(addr)
+        if buf is None:
+            gcmd.respond_info("CFS_BUFFER: box %d: no response" % addr)
+        else:
+            gcmd.respond_info("CFS_BUFFER: box %d: %s (0x%02X)" % (addr, buf["state"], buf["code"]))
 
     cmd_CFS_FW_VERSION_help: str = (
         "Query firmware version string from CFS box via 0xF0 VERSION_INFO command. "
