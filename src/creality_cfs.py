@@ -249,6 +249,7 @@ Resolved in v1.2.0:
     sensor-gated push loop).
 """
 
+import json
 import logging
 import os
 import struct
@@ -1054,6 +1055,10 @@ class CrealityCFS:
         # does not forget it. K1 Max stock reads 0x00 here when the path is clear; the Hi's
         # meaning of this channel is not wire-confirmed, so it defaults off.
         self.detect_path_on_connect: bool = config.getboolean("detect_path_on_connect", False)
+        # afc_compat: publish the CFS to Fluidd's AFC panel and keep per-slot filament data
+        # (material/colour/tool map/runout slot) with the AFC G-code surface. See CFSAfcBridge.
+        self._presence_every = 4            # heartbeat ticks between slot-presence refreshes
+        self._heartbeat_count = 0
         # The requested baud is mapped to a termios B-constant lazily in the connect path
         # (_resolve_baud_const, called from _config_tty). It is NOT resolved here because
         # termios does not exist off-POSIX and __init__ must construct on any host (the
@@ -1201,6 +1206,7 @@ class CrealityCFS:
         # Guarded so a real stock `box` object (if ever present) is never clobbered.
         if self.printer.lookup_object("box", None) is None:
             self.printer.add_object("box", CFSBoxStatus(self))
+        self.afc = CFSAfcBridge(self, config) if config.getboolean("afc_compat", False) else None
 
         logger.info("creality_cfs: module loaded, port=%s baud=%d", self.serial_port, self.baud)
 
@@ -1233,14 +1239,29 @@ class CrealityCFS:
         if self._shutdown:
             return self.reactor.NEVER
         if self.is_connected and not self._bus_lock.test():
+            self._heartbeat_count += 1
+            refresh = self._heartbeat_count % self._presence_every == 0
             for entry in self._box_table:
                 if entry.online == BoxAddressEntry.ONLINE_ONLINE:
                     try:
                         self.get_box_state(entry.addr, retries=1)
+                        if refresh and entry.addr == 0x01:
+                            self.refresh_slot_presence(entry.addr)
                     except Exception:
                         logger.exception("creality_cfs: heartbeat poll failed (addr 0x%02X)",
                                          entry.addr)
         return eventtime + self.heartbeat_interval
+
+    def refresh_slot_presence(self, addr: int) -> None:
+        """Update the per-slot `present` cache from 0x08 channel 0 (bitmask of slots with
+        filament in the box), so a spool inserted or run out after connect-init shows up."""
+        flag = self.get_hardware_status(addr, HW_SENSOR_MATERIAL, quiet=True)
+        if not 0 <= flag <= 0x0F:
+            return
+        for idx in range(4):
+            slot = self._slots.setdefault(idx, {"present": False, "material": "unknown",
+                                                "remain": -1})
+            slot["present"] = bool(flag & SLOT_BITMASKS[idx])
 
     def _auto_init_callback(self, eventtime: float) -> None:
         """Reactor callback to run auto-addressing on klippy:ready.
@@ -2710,7 +2731,7 @@ class CrealityCFS:
             return SLOT_BITMASKS.index(flag)
         return None
 
-    def get_hardware_status(self, addr: int, channel: int) -> int:
+    def get_hardware_status(self, addr: int, channel: int, quiet: bool = False) -> int:
         """CMD_GET_HARDWARE_STATUS (0x08): read toolhead filament-sensor / hardware status.
 
         WIRE-CONFIRMED 2026-06-09. This is the EXTRUDER filament-sensor read the load logic
@@ -2746,7 +2767,7 @@ class CrealityCFS:
 
         data_bytes = resp.get("data", b"")
         flag = data_bytes[0] if len(data_bytes) >= 1 else 0xFF
-        logger.info(
+        (logger.debug if quiet else logger.info)(
             "creality_cfs: GET_HARDWARE_STATUS addr=0x%02X ch=0x%02X flag=0x%02X", addr, channel, flag
         )
         return flag
@@ -3989,6 +4010,364 @@ class CFSBoxStatus:
 
     def get_status(self, eventtime) -> dict:
         return self._cfs._flat_box_status()
+
+
+# ---------------------------------------------------------------------------
+# AFC-compatible view (Fluidd's AFC panel) -- afc_compat: True
+# ---------------------------------------------------------------------------
+
+AFC_UNIT_TYPE: str = "CFS"
+AFC_UNIT_NAME: str = "CFS"
+AFC_HUB_NAME: str = "CFS"
+AFC_DEFAULT_WEIGHT_G: float = 1000.0
+_AFC_LANE_KEYS = ("material", "color", "weight", "spool_id", "extruder_temp", "bed_temp",
+                  "map", "runout_lane", "filament_name")
+
+
+class _AfcObject:
+    """A named Klipper status object whose get_status is a bound callable."""
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def get_status(self, eventtime) -> dict:
+        return self._fn(eventtime)
+
+
+class CFSAfcBridge:
+    """Expose the CFS to Fluidd's AFC (Armored Turtle) panel and keep per-slot filament data.
+
+    Registers the AFC-shaped status objects Fluidd reads (`AFC`, `AFC_CFS CFS`,
+    `AFC_lane slot1..4`, `AFC_hub CFS`, `AFC_extruder extruder`) and the AFC G-code surface
+    the panel sends (SET_COLOR, SET_MATERIAL, SET_WEIGHT, SET_SPOOL_ID, AFC_SET_SPOOL_TEMP,
+    SET_MAP, SET_RUNOUT, CHANGE_TOOL, TOOL_UNLOAD, LANE_UNLOAD, AFC_CLEAR_MESSAGE). Per-slot
+    data (material, colour, weight, tool map, runout lane, temps) persists in a JSON file.
+    Slot presence and the loaded slot come live from CrealityCFS; loads and unloads run the
+    printer's CFS_TOOL / CFS_UNLOAD macros so they follow the same choreography as T0-T3.
+    """
+
+    def __init__(self, cfs, config) -> None:
+        self.cfs = cfs
+        self.printer = cfs.printer
+        self.gcode = cfs.gcode
+        self.lane_names = ["slot%d" % (i + 1) for i in range(4)]
+        default_file = os.path.join(
+            os.path.dirname(self.printer.get_start_args().get("config_file", "") or "."),
+            "cfs_lanes.json")
+        self.data_file = config.get("lane_data_file", default_file)
+        self.extruder_name = config.get("afc_extruder", "extruder")
+        self._message = {"message": None, "type": None}
+        self.lanes = self._load()
+        self.printer.add_object("AFC", _AfcObject(self._afc_status))
+        self.printer.add_object("AFC_%s %s" % (AFC_UNIT_TYPE, AFC_UNIT_NAME),
+                                _AfcObject(self._unit_status))
+        self.printer.add_object("AFC_hub %s" % AFC_HUB_NAME, _AfcObject(self._hub_status))
+        self.printer.add_object("AFC_extruder %s" % self.extruder_name,
+                                _AfcObject(self._extruder_status))
+        for idx, name in enumerate(self.lane_names):
+            self.printer.add_object("AFC_lane %s" % name,
+                                    _AfcObject(lambda et, i=idx: self._lane_status(i)))
+        for cmd in ("SET_COLOR", "SET_MATERIAL", "SET_WEIGHT", "SET_SPOOL_ID",
+                    "AFC_SET_SPOOL_TEMP", "SET_MAP", "SET_RUNOUT", "CHANGE_TOOL",
+                    "TOOL_UNLOAD", "LANE_UNLOAD", "AFC_CLEAR_MESSAGE", "CFS_AUTO_REFILL",
+                    "CFS_LANES"):
+            self.gcode.register_command(cmd, getattr(self, "cmd_" + cmd),
+                                        desc=getattr(self, "cmd_%s_help" % cmd))
+
+    # ---- persistence ----
+    def _default_lane(self, idx: int) -> dict:
+        return {"material": None, "color": None, "weight": None, "spool_id": None,
+                "extruder_temp": None, "bed_temp": None, "map": "T%d" % idx,
+                "runout_lane": None, "filament_name": None}
+
+    def _load(self) -> list:
+        lanes = [self._default_lane(i) for i in range(4)]
+        try:
+            with open(self.data_file) as f:
+                saved = json.load(f)
+            for i, name in enumerate(self.lane_names):
+                for k in _AFC_LANE_KEYS:
+                    if k in saved.get(name, {}):
+                        lanes[i][k] = saved[name][k]
+        except (OSError, ValueError):
+            pass
+        return lanes
+
+    def _save(self) -> None:
+        data = {name: self.lanes[i] for i, name in enumerate(self.lane_names)}
+        tmp = self.data_file + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+            os.replace(tmp, self.data_file)
+        except OSError:
+            logger.exception("creality_cfs: could not save lane data to %s", self.data_file)
+
+    # ---- live state helpers ----
+    def _active(self):
+        return self.cfs._active_tool
+
+    def _toolhead_loaded(self) -> bool:
+        return self.cfs._toolhead_filament_detected() is True
+
+    def _present(self, idx: int) -> bool:
+        return bool(self.cfs._slots.get(idx, {}).get("present"))
+
+    def _material(self, idx: int):
+        if self.lanes[idx]["material"]:
+            return self.lanes[idx]["material"]
+        box = self.cfs._slots.get(idx, {}).get("material")
+        if box and box.lower() not in ("unknown", "none"):
+            return box
+        return None
+
+    def _weight(self, idx: int) -> float:
+        if self.lanes[idx]["weight"] is not None:
+            return float(self.lanes[idx]["weight"])
+        remain = self.cfs._slots.get(idx, {}).get("remain", -1)
+        if isinstance(remain, int) and 0 <= remain <= 100:
+            return AFC_DEFAULT_WEIGHT_G * remain / 100.0
+        return AFC_DEFAULT_WEIGHT_G
+
+    def lane_index(self, gcmd, key: str = "LANE") -> int:
+        name = gcmd.get(key).strip().lower()
+        if name in self.lane_names:
+            return self.lane_names.index(name)
+        raise gcmd.error("Unknown lane %r (use %s)" % (name, ", ".join(self.lane_names)))
+
+    def tool_map(self) -> dict:
+        """{"T0": slot index, ...}; unmapped tools fall back to the slot of the same number."""
+        out = {"T%d" % i: i for i in range(4)}
+        for idx, lane in enumerate(self.lanes):
+            maps = lane["map"] if isinstance(lane["map"], list) else [lane["map"]]
+            for m in maps:
+                if m:
+                    out[str(m).upper()] = idx
+        return out
+
+    # ---- status objects ----
+    def _lane_status(self, idx: int) -> dict:
+        lane = self.lanes[idx]
+        present = self._present(idx)
+        active = self._active() == idx
+        in_tool = active and self._toolhead_loaded()
+        if in_tool:
+            status, fstatus = "Tooled", "In Tool"
+        elif present:
+            status, fstatus = "Loaded", "Ready"
+        else:
+            status, fstatus = "None", "Not Ready"
+        return {
+            "name": self.lane_names[idx], "unit": AFC_UNIT_NAME, "hub": AFC_HUB_NAME,
+            "extruder": self.extruder_name, "buffer": None, "buffer_status": None,
+            "lane": idx + 1, "map": lane["map"], "load": present, "prep": present,
+            "tool_loaded": in_tool, "loaded_to_hub": active, "material": self._material(idx),
+            "spool_id": lane["spool_id"], "color": lane["color"], "weight": self._weight(idx),
+            "initial_weight": AFC_DEFAULT_WEIGHT_G, "filament_name": lane["filament_name"],
+            "extruder_temp": lane["extruder_temp"], "bed_temp": lane["bed_temp"],
+            "runout_lane": lane["runout_lane"], "filament_status": fstatus,
+            "filament_status_led": "", "status": status, "dist_hub": 0,
+        }
+
+    def _current_lane(self):
+        active = self._active()
+        return self.lane_names[active] if active is not None else None
+
+    def _afc_status(self, eventtime) -> dict:
+        current = self._current_lane()
+        return {
+            "current_load": current if self._toolhead_loaded() else None,
+            "current_lane": current, "next_lane": None, "current_state": "Idle",
+            "current_toolchange": 0, "number_of_toolchanges": 0, "spoolman": None,
+            "td1_present": False, "lane_data_enabled": False, "error_state": False,
+            "bypass_state": False, "quiet_mode": False, "position_saved": False,
+            "extruders": [self.extruder_name], "hubs": [AFC_HUB_NAME],
+            "units": ["%s %s" % (AFC_UNIT_TYPE, AFC_UNIT_NAME)],
+            "lanes": list(self.lane_names), "buffers": [], "message": dict(self._message),
+            "led_state": False, "tool_map": self.tool_map(),
+        }
+
+    def _unit_status(self, eventtime) -> dict:
+        return {"lanes": list(self.lane_names), "extruders": [self.extruder_name],
+                "hubs": [AFC_HUB_NAME], "buffers": []}
+
+    def _hub_status(self, eventtime) -> dict:
+        return {"state": self._active() is not None, "cut": True,
+                "cut_cmd": "CFS_CUT_FILAMENT", "cut_dist": 0, "cut_clear": 0,
+                "cut_min_length": 0, "cut_servo_pass_angle": 0, "cut_servo_clip_angle": 0,
+                "cut_servo_prep_angle": 0, "lanes": list(self.lane_names),
+                "afc_bowden_length": 0}
+
+    def _extruder_status(self, eventtime) -> dict:
+        loaded = self._toolhead_loaded()
+        return {"tool_stn": 0, "tool_stn_unload": 0, "tool_sensor_after_extruder": 0,
+                "tool_unload_speed": 0, "tool_load_speed": 0, "buffer": None,
+                "lane_loaded": self._current_lane() if loaded else None,
+                "tool_start": self.cfs.filament_sensor_name, "tool_start_status": loaded,
+                "tool_end": None, "tool_end_status": False, "lanes": list(self.lane_names)}
+
+    # ---- lane data commands ----
+    cmd_SET_COLOR_help = "Set a CFS slot's filament colour. LANE=<slotN> COLOR=<RRGGBB>"
+
+    def cmd_SET_COLOR(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        color = gcmd.get("COLOR").strip().lstrip("#")
+        if len(color) not in (6, 8) or any(c not in "0123456789abcdefABCDEF" for c in color):
+            raise gcmd.error("SET_COLOR: COLOR must be hex RRGGBB")
+        self.lanes[idx]["color"] = "#" + color[:6].upper()
+        self._save()
+        gcmd.respond_info("CFS: %s colour %s" % (self.lane_names[idx], self.lanes[idx]["color"]))
+
+    cmd_SET_MATERIAL_help = "Set a CFS slot's material. LANE=<slotN> MATERIAL=<PLA|PETG|...>"
+
+    def cmd_SET_MATERIAL(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        material = gcmd.get("MATERIAL").strip()
+        self.lanes[idx]["material"] = material or None
+        self._save()
+        gcmd.respond_info("CFS: %s material %s" % (self.lane_names[idx], material or "-"))
+
+    cmd_SET_WEIGHT_help = "Set a CFS slot's remaining filament weight in grams. LANE= WEIGHT="
+
+    def cmd_SET_WEIGHT(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        self.lanes[idx]["weight"] = gcmd.get_float("WEIGHT", minval=0.)
+        self._save()
+
+    cmd_SET_SPOOL_ID_help = "Link a CFS slot to a Spoolman spool. LANE= SPOOL_ID=<id or empty>"
+
+    def cmd_SET_SPOOL_ID(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        raw = gcmd.get("SPOOL_ID", "").strip()
+        self.lanes[idx]["spool_id"] = int(raw) if raw.isdigit() else None
+        self._save()
+
+    cmd_AFC_SET_SPOOL_TEMP_help = "Set a CFS slot's temperatures. LANE= EXTRUDER_TEMP= [BED_TEMP=]"
+
+    def cmd_AFC_SET_SPOOL_TEMP(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        self.lanes[idx]["extruder_temp"] = gcmd.get_float("EXTRUDER_TEMP", None, minval=0.)
+        self.lanes[idx]["bed_temp"] = gcmd.get_float("BED_TEMP", None, minval=0.)
+        self._save()
+
+    cmd_SET_MAP_help = "Map a slicer tool to a CFS slot. LANE=<slotN> MAP=<Tn>"
+
+    def cmd_SET_MAP(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        tool = gcmd.get("MAP").strip().upper()
+        if not (len(tool) >= 2 and tool[0] == "T" and tool[1:].isdigit()):
+            raise gcmd.error("SET_MAP: MAP must be a tool like T0")
+        old = self.lanes[idx]["map"]
+        for other in self.lanes:          # swap with the slot that had this tool (AFC behaviour)
+            if other is not self.lanes[idx] and other["map"] == tool:
+                other["map"] = old
+        self.lanes[idx]["map"] = tool
+        self._save()
+        gcmd.respond_info("CFS: %s -> %s" % (tool, self.lane_names[idx]))
+
+    cmd_SET_RUNOUT_help = "Set the slot to continue with when a slot runs out. LANE= RUNOUT=<slotN|NONE>"
+
+    def cmd_SET_RUNOUT(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        target = gcmd.get("RUNOUT").strip().lower()
+        if target in ("", "none"):
+            self.lanes[idx]["runout_lane"] = None
+        elif target in self.lane_names and target != self.lane_names[idx]:
+            self.lanes[idx]["runout_lane"] = target
+        else:
+            raise gcmd.error("SET_RUNOUT: RUNOUT must be another slot or NONE")
+        self._save()
+
+    cmd_AFC_CLEAR_MESSAGE_help = "Clear the CFS message shown in the AFC panel"
+
+    def cmd_AFC_CLEAR_MESSAGE(self, gcmd) -> None:
+        self._message = {"message": None, "type": None}
+
+    cmd_CFS_LANES_help = "Show the CFS slot data (material, colour, map, runout slot)"
+
+    def cmd_CFS_LANES(self, gcmd) -> None:
+        lines = []
+        for idx, name in enumerate(self.lane_names):
+            st = self._lane_status(idx)
+            lines.append("%s %s: %s %s map=%s runout=%s %s" % (
+                name, st["status"], st["material"] or "-", st["color"] or "-",
+                st["map"], st["runout_lane"] or "-",
+                "(%.0f C)" % st["extruder_temp"] if st["extruder_temp"] else ""))
+        gcmd.respond_info("\n".join(lines))
+
+    # ---- load / unload from the panel ----
+    cmd_CHANGE_TOOL_help = "Load a CFS slot into the toolhead. LANE=<slotN>"
+
+    def cmd_CHANGE_TOOL(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        temp = self.lanes[idx]["extruder_temp"]
+        self.gcode.run_script_from_command(
+            "CFS_TOOL TOOL=%d%s" % (idx, " TEMP=%.0f" % temp if temp else ""))
+
+    cmd_TOOL_UNLOAD_help = "Cut and return the loaded CFS slot to the box. [LANE=<slotN>]"
+
+    def cmd_TOOL_UNLOAD(self, gcmd) -> None:
+        if gcmd.get("LANE", None):
+            idx = self.lane_index(gcmd)
+            self.gcode.run_script_from_command("CFS_UNLOAD TOOL=%d" % idx)
+        else:
+            self.gcode.run_script_from_command("CFS_UNLOAD")
+
+    cmd_LANE_UNLOAD_help = "Return a CFS slot's filament from the path to the box. LANE=<slotN>"
+
+    def cmd_LANE_UNLOAD(self, gcmd) -> None:
+        idx = self.lane_index(gcmd)
+        if self._active() == idx:
+            self.gcode.run_script_from_command("CFS_UNLOAD TOOL=%d" % idx)
+        else:
+            gcmd.respond_info("CFS: %s is not in the path; nothing to unload" %
+                              self.lane_names[idx])
+
+    # ---- auto-refill (AFC "infinite spool") ----
+    def refill_target(self, idx: int):
+        """The slot to continue with after slot idx runs out: its runout_lane if that slot
+        has filament, else another loaded slot with the same material and colour. None if
+        there is no match (both must be set to match automatically)."""
+        lane = self.lanes[idx]
+        target = lane["runout_lane"]
+        if target in self.lane_names:
+            t = self.lane_names.index(target)
+            return t if self._present(t) else None
+        mat, col = self._material(idx), lane["color"]
+        if not mat or not col:
+            return None
+        for cand in range(4):
+            if cand == idx or not self._present(cand):
+                continue
+            cmat, ccol = self._material(cand), self.lanes[cand]["color"]
+            if cmat and ccol and cmat.lower() == mat.lower() and ccol.lower() == col.lower():
+                return cand
+        return None
+
+    cmd_CFS_AUTO_REFILL_help = ("After a runout pause: continue with the refill slot of FROM= "
+                                "(its runout slot, or same material and colour) and RESUME")
+
+    def cmd_CFS_AUTO_REFILL(self, gcmd) -> None:
+        src = gcmd.get_int("FROM", -1)
+        if not 0 <= src <= 3:
+            gcmd.respond_info("CFS: auto-refill skipped (slot that ran out is unknown)")
+            return
+        target = self.refill_target(src)
+        if target is None:
+            self._message = {"message": "%s ran out; no refill slot" % self.lane_names[src],
+                             "type": "warning"}
+            gcmd.respond_info("CFS: %s ran out and has no refill slot. Load a slot with "
+                              "CFS_TOOL TOOL=<0-3> (or CHANGE_TOOL LANE=<slotN>), then RESUME."
+                              % self.lane_names[src])
+            return
+        self._message = {"message": "%s ran out; continued with %s"
+                         % (self.lane_names[src], self.lane_names[target]), "type": "info"}
+        gcmd.respond_info("CFS: %s ran out, continuing with %s"
+                          % (self.lane_names[src], self.lane_names[target]))
+        temp = self.lanes[target]["extruder_temp"]
+        self.gcode.run_script_from_command(
+            "CFS_TOOL TOOL=%d%s" % (target, " TEMP=%.0f" % temp if temp else ""))
+        self.gcode.run_script_from_command("RESUME")
 
 
 # ---------------------------------------------------------------------------

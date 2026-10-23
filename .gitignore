@@ -48,3 +48,4 @@ SLICK1MAX/
 # Klipper build artifacts
 *.so
 *.o
+graphify-out/
