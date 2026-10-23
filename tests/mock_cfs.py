@@ -101,6 +101,7 @@ class MockCFSHardware:
         # Per-box state: indexed by 0-based slot (addr = slot + 1)
         self._addressed = [False] * box_count   # has received SET_SLAVE_ADDR
         self._modes = [0x00] * box_count         # current box mode
+        self._loader = [False] * box_count       # cold-boot loader: addressing only
         self._pre_loading = [0x00] * box_count  # pre-loading slot mask
         # v1.4.0 choreography state:
         self._loaded = [False] * box_count      # box in print-mode (0x0A data[3] == 0x02)
@@ -140,6 +141,12 @@ class MockCFSHardware:
 
         func = parsed["func"]
         self._received.append((func, parsed))
+
+        # A box in its loader answers only the addressing layer.
+        slot = parsed["addr"] - 1
+        if (parsed["status"] == STATUS_OPERATIONAL and 0 <= slot < self.box_count
+                and self._loader[slot]):
+            return None
 
         # Apply error injection if configured for this command
         err = self._consume_error(func)
@@ -209,7 +216,14 @@ class MockCFSHardware:
 
     def _resp_loader_to_app(self, addr, data):
         """CMD_LOADER_TO_APP: broadcast wakeup, no response expected per protocol."""
-        # Boxes do not respond to the broadcast wake command
+        # Boxes do not respond to the broadcast wake command. An addressed loader box starts
+        # its app with no address, so it answers discovery again.
+        for slot in range(self.box_count):
+            if self._loader[slot] and self._addressed[slot]:
+                self._loader[slot] = False
+                self._addressed[slot] = False
+                if slot not in self._discovery_queue:
+                    self._discovery_queue.append(slot)
         return None
 
     def _resp_get_slave_info(self, addr, data):
@@ -218,7 +232,7 @@ class MockCFSHardware:
             return None
         slot = self._discovery_queue.pop(0)
         uniid = self._uniids[slot]
-        resp_data = bytes([DEV_TYPE_MB, 0x00]) + bytes(uniid)
+        resp_data = bytes([DEV_TYPE_MB, int(self._loader[slot])]) + bytes(uniid)
         # Response address is the box's future address (slot + 1)
         return build_message(slot + 1, STATUS_ADDRESSING, CMD_GET_SLAVE_INFO, resp_data)
 
@@ -231,7 +245,7 @@ class MockCFSHardware:
         if 0 <= slot < self.box_count:
             self._addressed[slot] = True
             uniid = self._uniids[slot]
-            resp_data = bytes([DEV_TYPE_MB, self._modes[slot]]) + bytes(uniid)
+            resp_data = bytes([DEV_TYPE_MB, int(self._loader[slot])]) + bytes(uniid)
             return build_message(target_addr, STATUS_ADDRESSING, CMD_SET_SLAVE_ADDR, resp_data)
         return None
 
@@ -241,7 +255,7 @@ class MockCFSHardware:
         if not (0 <= slot < self.box_count):
             return None
         uniid = self._uniids[slot]
-        resp_data = bytes([DEV_TYPE_MB, self._modes[slot]]) + bytes(uniid)
+        resp_data = bytes([DEV_TYPE_MB, int(self._loader[slot])]) + bytes(uniid)
         return build_message(addr, STATUS_ADDRESSING, CMD_ONLINE_CHECK, resp_data)
 
     def _resp_get_addr_table(self, addr, data):
@@ -435,12 +449,23 @@ class MockCFSHardware:
         """Reset all box state and error injections to initial values."""
         self._addressed = [False] * self.box_count
         self._modes = [0x00] * self.box_count
+        self._loader = [False] * self.box_count
         self._pre_loading = [0x00] * self.box_count
         self._loaded = [False] * self.box_count
         self._wheel_mm = [-100.0] * self.box_count
         self._discovery_queue = list(range(self.box_count))
         self._error_injections.clear()
         self._received.clear()
+
+    def set_loader(self, slot_index, loader=True):
+        """Put a box in its cold-boot loader (answers addressing only, mode byte 1)."""
+        self._loader[slot_index] = bool(loader)
+
+    def restart_box(self, slot_index):
+        """Simulate a box power-cycle: address lost, answers discovery again."""
+        self._addressed[slot_index] = False
+        if slot_index not in self._discovery_queue:
+            self._discovery_queue.append(slot_index)
 
     def set_loaded(self, slot_index, loaded=True):
         """Force the loaded/print-locked flag for a box (GET_BOX_STATE data[3])."""

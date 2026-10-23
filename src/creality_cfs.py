@@ -658,6 +658,16 @@ FLUSH_VELOCITY_DEFAULT: float = 360.0
 BOX_WAKE_PROBE_TIMEOUT_S: float = 12.0
 BOX_PROBE_RETRY_MAX: int = 8
 BOX_PROBE_RETRY_DELAY_S: float = 1.0
+# A cold-booted box answers discovery and takes its address in LOADER mode (mode byte 1),
+# where it ignores every operational command (front LEDs blink red). Stock auto_addr sends
+# 0x0B [01] to 0xFF after addressing; the box then starts its app with NO address and has to
+# be discovered and addressed again. Bounded passes of addressing + wake, LOADER_WAKE_DELAY_S
+# apart (verified on the K1 Max box: the app answers right after it is re-addressed).
+LOADER_WAKE_PASSES: int = 4
+LOADER_WAKE_DELAY_S: float = 1.0
+# Consecutive silent heartbeats before the box is re-addressed and connect-inited again
+# (box power-cycled or replugged while Klipper kept running).
+HEARTBEAT_LOST_REINIT: int = 3
 
 # ---------------------------------------------------------------------------
 # Per-command timeouts
@@ -1059,6 +1069,7 @@ class CrealityCFS:
         # (material/colour/tool map/runout slot) with the AFC G-code surface. See CFSAfcBridge.
         self._presence_every = 4            # heartbeat ticks between slot-presence refreshes
         self._heartbeat_count = 0
+        self._heartbeat_misses = 0
         # The requested baud is mapped to a termios B-constant lazily in the connect path
         # (_resolve_baud_const, called from _config_tty). It is NOT resolved here because
         # termios does not exist off-POSIX and __init__ must construct on any host (the
@@ -1241,16 +1252,36 @@ class CrealityCFS:
         if self.is_connected and not self._bus_lock.test():
             self._heartbeat_count += 1
             refresh = self._heartbeat_count % self._presence_every == 0
+            silent = False
             for entry in self._box_table:
                 if entry.online == BoxAddressEntry.ONLINE_ONLINE:
                     try:
-                        self.get_box_state(entry.addr, retries=1)
-                        if refresh and entry.addr == 0x01:
+                        if self.get_box_state(entry.addr, retries=1) is None:
+                            silent = True
+                        elif refresh and entry.addr == 0x01:
                             self.refresh_slot_presence(entry.addr)
                     except Exception:
                         logger.exception("creality_cfs: heartbeat poll failed (addr 0x%02X)",
                                          entry.addr)
+            self._heartbeat_misses = self._heartbeat_misses + 1 if silent else 0
+            if self._heartbeat_misses >= HEARTBEAT_LOST_REINIT:
+                self._heartbeat_misses = 0
+                self._reconnect_boxes()
         return eventtime + self.heartbeat_interval
+
+    def _reconnect_boxes(self) -> None:
+        """Re-address (waking a box stuck in its loader) and re-run connect-init for any box
+        that went silent, e.g. a CFS power-cycled while Klipper kept running."""
+        logger.info("creality_cfs: box silent for %d heartbeats, re-addressing",
+                    HEARTBEAT_LOST_REINIT)
+        try:
+            self._run_auto_addressing()
+        except Exception:
+            logger.exception("creality_cfs: re-addressing failed (non-fatal)")
+            return
+        self._connected.clear()
+        self._probe_attempts = 0
+        self.reactor.register_callback(self._connect_probe)
 
     def refresh_slot_presence(self, addr: int) -> None:
         """Update the per-slot `present` cache from 0x08 channel 0 (bitmask of slots with
@@ -1779,37 +1810,58 @@ class CrealityCFS:
             retries=1,
         )
 
-        # Step 2: Discover all boxes via broadcast GET_SLAVE_INFO
-        # TIMEOUT_LONG intentional: boxes may respond at different times
-        logger.info(
-            "creality_cfs: step 2, CMD_GET_SLAVE_INFO broadcast (%.1f s timeout)", TIMEOUT_LONG
-        )
-        # Send the broadcast with the MB broadcast address in the data field
-        # (pattern from auto_addr_wrapper.py: send_data = [broadcast_addr, broadcast_addr])
-        discovered: list = self._discover_slaves()
-        logger.info("creality_cfs: discovered %d box(es)", len(discovered))
+        for wake_pass in range(LOADER_WAKE_PASSES):
+            # Step 2: Discover all boxes via broadcast GET_SLAVE_INFO
+            # TIMEOUT_LONG intentional: boxes may respond at different times
+            logger.info(
+                "creality_cfs: step 2, CMD_GET_SLAVE_INFO broadcast (%.1f s timeout)", TIMEOUT_LONG
+            )
+            # Send the broadcast with the MB broadcast address in the data field
+            # (pattern from auto_addr_wrapper.py: send_data = [broadcast_addr, broadcast_addr])
+            discovered: list = self._discover_slaves()
+            logger.info("creality_cfs: discovered %d box(es)", len(discovered))
 
-        # Step 3: Assign addresses
-        logger.debug("creality_cfs: step 3, CMD_SET_SLAVE_ADDR for each discovered box")
-        for attempt in range(MAX_SET_TIMES):
+            # Step 3: Assign addresses
+            logger.debug("creality_cfs: step 3, CMD_SET_SLAVE_ADDR for each discovered box")
+            for attempt in range(MAX_SET_TIMES):
+                for entry in self._box_table:
+                    if entry.mapped and entry.online in (
+                        BoxAddressEntry.ONLINE_INIT, BoxAddressEntry.ONLINE_WAIT_ACK
+                    ):
+                        self._set_slave_addr(BROADCAST_ADDR_MB, entry.addr, entry.uniid)
+
+            # Step 4: Online check per box
+            logger.debug("creality_cfs: step 4, CMD_ONLINE_CHECK per box")
             for entry in self._box_table:
-                if entry.mapped and entry.online in (
-                    BoxAddressEntry.ONLINE_INIT, BoxAddressEntry.ONLINE_WAIT_ACK
-                ):
-                    self._set_slave_addr(BROADCAST_ADDR_MB, entry.addr, entry.uniid)
+                if entry.mapped:
+                    self._online_check(entry.addr)
 
-        # Step 4: Online check per box
-        logger.debug("creality_cfs: step 4, CMD_ONLINE_CHECK per box")
-        for entry in self._box_table:
-            if entry.mapped:
-                self._online_check(entry.addr)
+            # Step 5: Confirm address table
+            logger.debug("creality_cfs: step 5, CMD_GET_ADDR_TABLE per box")
+            for attempt in range(MAX_GET_TIMES):
+                for entry in self._box_table:
+                    if entry.online != BoxAddressEntry.ONLINE_ONLINE:
+                        self._get_addr_table(entry.addr)
 
-        # Step 5: Confirm address table
-        logger.debug("creality_cfs: step 5, CMD_GET_ADDR_TABLE per box")
-        for attempt in range(MAX_GET_TIMES):
-            for entry in self._box_table:
-                if entry.online != BoxAddressEntry.ONLINE_ONLINE:
-                    self._get_addr_table(entry.addr)
+            # Step 6 (stock loader_check): a box still in its loader never answers
+            # operational commands. Start its app, then address it again next pass.
+            if not any(e.mapped and e.mode == BoxAddressEntry.MODE_LOADER
+                       for e in self._box_table):
+                break
+            if wake_pass == LOADER_WAKE_PASSES - 1:
+                logger.warning("creality_cfs: box still in loader mode after %d wake attempts",
+                               LOADER_WAKE_PASSES)
+                break
+            logger.info("creality_cfs: box in loader mode, sending LOADER_TO_APP")
+            self._send_command(
+                BROADCAST_ADDR_ALL,
+                STATUS_ADDRESSING,
+                CMD_LOADER_TO_APP,
+                data=bytes([0x01]),
+                timeout=TIMEOUT_SHORT,
+                retries=1,
+            )
+            self.reactor.pause(self.reactor.monotonic() + LOADER_WAKE_DELAY_S)
 
         online_count: int = sum(
             1 for e in self._box_table if e.online == BoxAddressEntry.ONLINE_ONLINE
@@ -1867,6 +1919,7 @@ class CrealityCFS:
                 logger.warning("creality_cfs: no free address slots for discovered box")
                 continue
 
+            self._box_table[addr - 1].mode = mode
             logger.info(
                 "creality_cfs: discovered box, addr=0x%02X mode=%d uniid=%s",
                 addr, mode, " ".join(f"0x{b:02X}" for b in uniid),
@@ -1889,11 +1942,14 @@ class CrealityCFS:
         Returns:
             int: Assigned address (0x01-0x04), or -1 if no slot available.
         """
-        # Priority 1: previously mapped, matching UniID, not currently online
+        # Priority 1: previously mapped, matching UniID. A box we think is online that
+        # answers the broadcast has restarted (or left its loader) and lost its address.
         for entry in self._box_table:
-            if (entry.mapped
-                    and entry.online in (BoxAddressEntry.ONLINE_OFFLINE, BoxAddressEntry.ONLINE_INIT)
-                    and entry.uniid == uniid):
+            if entry.mapped and entry.uniid == uniid:
+                if entry.online == BoxAddressEntry.ONLINE_ONLINE:
+                    logger.info("creality_cfs: box 0x%02X answered discovery, it restarted; "
+                                "re-addressing", entry.addr)
+                    entry.acked = False
                 entry.online = BoxAddressEntry.ONLINE_WAIT_ACK
                 return entry.addr
 
@@ -1956,6 +2012,7 @@ class CrealityCFS:
                     entry.acked = True
                     entry.online = BoxAddressEntry.ONLINE_ONLINE
                     entry.lost_cnt = 0
+                    entry.mode = data_bytes[1]
                     logger.info("creality_cfs: addr=0x%02X acknowledged SET_SLAVE_ADDR", target_addr)
                     break
         return True
@@ -1990,11 +2047,14 @@ class CrealityCFS:
                     break
             return False
 
+        data_bytes = resp.get("data", b"")
         for entry in self._box_table:
             if entry.addr == addr:
                 entry.acked = True
                 entry.online = BoxAddressEntry.ONLINE_ONLINE
                 entry.lost_cnt = 0
+                if len(data_bytes) >= 2:
+                    entry.mode = data_bytes[1]
                 break
         return True
 
