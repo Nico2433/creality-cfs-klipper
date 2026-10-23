@@ -363,3 +363,35 @@ class TestMeltGuard:
         with pytest.raises(Exception, match="cold-extrude floor"):
             cfs._melt_guard(gcmd, "CFS_EXTRUDE")
         assert not any(s.startswith("M109") for s in _scripts(cfs))
+
+
+# ===========================================================================
+# Post-load buffer read: a transient "full" is re-checked later, not reported now
+# ===========================================================================
+
+class TestPostLoadBufferRecheck:
+
+    def test_full_buffer_after_load_defers_the_report(self):
+        cfs, hw = _wired()
+        cfs._toolhead_filament_detected = _sequence_sensor([False, True])
+        cfs.get_buffer_state = mock.MagicMock(return_value={"code": 0x01, "state": "full"})
+        cfs.reactor.register_callback.reset_mock()
+        gcmd = _load_gcmd()
+
+        cfs.load_process(gcmd, 0x01, SLOT_T0)
+
+        infos = [c.args[0] for c in gcmd.respond_info.call_args_list]
+        assert not any("buffer" in s for s in infos)
+        cb, when = cfs.reactor.register_callback.call_args.args
+        cb(when)
+        msgs = [c.args[0] for c in cfs.gcode.respond_info.call_args_list]
+        assert any("still reads full" in m for m in msgs)
+
+    def test_recheck_is_quiet_once_the_buffer_settles(self):
+        cfs, hw = _wired()
+        cfs.get_buffer_state = mock.MagicMock(return_value={"code": 0x00, "state": "middle"})
+        cfs.gcode.respond_info.reset_mock()
+
+        cfs._recheck_buffer_after_load(0x01)
+
+        cfs.gcode.respond_info.assert_not_called()

@@ -668,6 +668,8 @@ LOADER_WAKE_DELAY_S: float = 1.0
 # Consecutive silent heartbeats before the box is re-addressed and connect-inited again
 # (box power-cycled or replugged while Klipper kept running).
 HEARTBEAT_LOST_REINIT: int = 3
+# The buffer can read full right after a load; stock checks it again ~7 s later.
+BUFFER_SETTLE_S: float = 7.0
 # Plausible box temperatures in the 0x0A idle reply; anything else is not an env reading.
 BOX_ENV_TEMP_RANGE: tuple = (0, 80)
 
@@ -1069,7 +1071,7 @@ class CrealityCFS:
         self.detect_path_on_connect: bool = config.getboolean("detect_path_on_connect", False)
         # afc_compat: publish the CFS to Fluidd's AFC panel and keep per-slot filament data
         # (material/colour/tool map/runout slot) with the AFC G-code surface. See CFSAfcBridge.
-        self._presence_every = 4            # heartbeat ticks between slot-presence refreshes
+        self._presence_every = 1            # heartbeat ticks between slot-presence refreshes
         self._heartbeat_count = 0
         self._heartbeat_misses = 0
         # (temperature, humidity) per box address from the idle 0x0A replies.
@@ -2863,6 +2865,20 @@ class CrealityCFS:
             return None
         return st["code"]
 
+    def _recheck_buffer_after_load(self, addr: int) -> None:
+        """Second post-load 0x05 read, BUFFER_SETTLE_S after the load; report only if the
+        buffer is still not in the middle."""
+        if self._shutdown or not self.is_connected:
+            return
+        try:
+            buf = self.get_buffer_state(addr)
+        except Exception:
+            logger.exception("creality_cfs: post-load buffer recheck failed")
+            return
+        if buf is not None and buf["code"] != BUFFER_STATE_MIDDLE:
+            self.gcode.respond_info("CFS: buffer still reads %s %.0f s after the load "
+                                    "(expected middle)" % (buf["state"], BUFFER_SETTLE_S))
+
     def cut_state(self, addr: int) -> bool:
         """DEPRECATED bool form: True iff the 0x05 byte reads 0x00 (buffer middle).
 
@@ -3099,8 +3115,10 @@ class CrealityCFS:
         if buf is None:
             gcmd.respond_info("CFS_EXTRUDE: post-load buffer read (0x05): no response.")
         elif buf["code"] != BUFFER_STATE_MIDDLE:
-            gcmd.respond_info("CFS_EXTRUDE: post-load buffer reads %s (stock expects "
-                              "middle) -- informational." % buf["state"])
+            # Often transient right after the ramp: read again once it has settled.
+            self.reactor.register_callback(
+                lambda et, a=addr: self._recheck_buffer_after_load(a),
+                self.reactor.monotonic() + BUFFER_SETTLE_S)
         self.set_print_mode(addr, slot)                # 0x04 [slot][00]
         if self.release_feeder_after_load:
             self.ctrl_connection_motor_action(addr, False)  # 0x0F 00 release
