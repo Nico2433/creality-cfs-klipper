@@ -314,8 +314,12 @@ class MockCFSHardware:
         slot = addr - 1
         if not (0 <= slot < self.box_count):
             return None
+        flag = 0x01
+        path_flag = getattr(self, "path_flag", None)   # 0x08 ch 0x01 (five-way) override
+        if path_flag is not None and data[:1] == b"\x01":
+            flag = path_flag
         return build_message(addr, STATUS_ADDRESSING, CMD_GET_HARDWARE_STATUS,
-                             bytes([0x01]))
+                             bytes([flag]))
 
     def _resp_cut_state(self, addr, data):
         """0x05 GET_BUFFER_STATE (historical name CUT_STATE): return 0x00 (buffer middle,

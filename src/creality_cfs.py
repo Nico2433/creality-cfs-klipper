@@ -1049,6 +1049,11 @@ class CrealityCFS:
         self.heartbeat_interval: float = config.getfloat(
             "heartbeat_interval", 0., minval=0., maxval=60.)
         self._heartbeat_timer = None
+        # detect_path_on_connect: at connect-init, read 0x08 ch 0x01 (stock five_way_state)
+        # and adopt the slot whose filament is in the path as the loaded tool, so a restart
+        # does not forget it. K1 Max stock reads 0x00 here when the path is clear; the Hi's
+        # meaning of this channel is not wire-confirmed, so it defaults off.
+        self.detect_path_on_connect: bool = config.getboolean("detect_path_on_connect", False)
         # The requested baud is mapped to a termios B-constant lazily in the connect path
         # (_resolve_baud_const, called from _config_tty). It is NOT resolved here because
         # termios does not exist off-POSIX and __init__ must construct on any host (the
@@ -1154,6 +1159,11 @@ class CrealityCFS:
             "CFS_FEEDER",
             self.cmd_CFS_FEEDER,
             desc=self.cmd_CFS_FEEDER_help,
+        )
+        self.gcode.register_command(
+            "CFS_DETECT",
+            self.cmd_CFS_DETECT,
+            desc=self.cmd_CFS_DETECT_help,
         )
         self.gcode.register_command(
             "CFS_BUFFER",
@@ -1306,6 +1316,12 @@ class CrealityCFS:
             self._ingest_slot_reads(mat, rem)
             logger.info("creality_cfs: box 0x%02X connect-init done sn=%s slots=%s",
                         addr, sn, self._slots)
+            if self.detect_path_on_connect and self._active_tool is None:
+                tool = self.detect_path_slot(addr)
+                if tool is not None:
+                    self._active_tool = tool
+                    logger.info("creality_cfs: filament from slot T%d is in the path "
+                                "(recovered after restart)", tool)
         except Exception:
             logger.exception("creality_cfs: connect-init for 0x%02X failed (non-fatal)", addr)
 
@@ -2683,6 +2699,17 @@ class CrealityCFS:
             "(status 0x%02X/0x%02X)", addr, slot, st_start, st_finish)
         return True
 
+    def detect_path_slot(self, addr: int):
+        """Which slot's filament is in the shared path to the toolhead: 0x08 channel 0x01
+        (stock `five_way_state`). The flag is the slot bitmask, 0x00 when the path is clear
+        (stock reads it at the end of every print, and before unloading a slot it lost track
+        of after a restart). Returns the 0-based tool index, or None when the path is clear,
+        the box does not answer, or the flag is not a single slot."""
+        flag = self.get_hardware_status(addr, HW_SENSOR_CONNECTIONS)
+        if flag in SLOT_BITMASKS:
+            return SLOT_BITMASKS.index(flag)
+        return None
+
     def get_hardware_status(self, addr: int, channel: int) -> int:
         """CMD_GET_HARDWARE_STATUS (0x08): read toolhead filament-sensor / hardware status.
 
@@ -3874,6 +3901,23 @@ class CrealityCFS:
         ok = self.ctrl_connection_motor_action(addr, bool(enable))
         gcmd.respond_info("CFS_FEEDER: box %d feeder %s%s" % (
             addr, "engaged" if enable else "released", "" if ok else " (no ACK)"))
+
+    cmd_CFS_DETECT_help: str = (
+        "Ask the CFS which slot's filament is in the path to the toolhead and adopt it as "
+        "the loaded tool (recovers the loaded slot after a restart). [BOX=<1-4>]"
+    )
+
+    def cmd_CFS_DETECT(self, gcmd) -> None:
+        """G-code: CFS_DETECT [BOX=<1-4>] -- 0x08 ch 0x01 path read; sets active_tool."""
+        if not self.is_connected:
+            raise gcmd.error("CFS serial port is not connected")
+        addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
+        tool = self.detect_path_slot(addr)
+        if tool is None:
+            gcmd.respond_info("CFS_DETECT: box %d path is clear (no slot detected)" % addr)
+            return
+        self._active_tool = tool
+        gcmd.respond_info("CFS_DETECT: box %d path holds slot T%d; active tool set" % (addr, tool))
 
     cmd_CFS_BUFFER_help: str = (
         "Read the filament buffer position from the CFS (0x05): middle/full/empty. "

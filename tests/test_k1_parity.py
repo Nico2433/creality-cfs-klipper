@@ -227,3 +227,52 @@ class TestHeartbeat:
         cfs.heartbeat_interval = 4.
         cfs._shutdown = True
         assert cfs._heartbeat(100.0) is cfs.reactor.NEVER
+
+
+class TestPathDetection:
+    def test_detect_returns_slot_from_bitmask(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x04                      # stock five_way_state: slot C in the path
+        assert cfs.detect_path_slot(0x01) == 2
+
+    def test_detect_clear_path(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x00
+        assert cfs.detect_path_slot(0x01) is None
+
+    def test_detect_ignores_multi_bit_flag(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x05
+        assert cfs.detect_path_slot(0x01) is None
+
+    def test_cmd_sets_active_tool(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x08
+        gcmd = _gcmd()
+        cfs.cmd_CFS_DETECT(gcmd)
+        assert cfs._active_tool == 3
+        assert any("holds slot T3" in s for s in _infos(gcmd))
+
+    def test_cmd_clear_path_keeps_active_tool(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x00
+        cfs._active_tool = None
+        gcmd = _gcmd()
+        cfs.cmd_CFS_DETECT(gcmd)
+        assert cfs._active_tool is None
+        assert any("path is clear" in s for s in _infos(gcmd))
+
+    def test_connect_init_adopts_path_slot_when_enabled(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x02
+        cfs.detect_path_on_connect = True
+        cfs._active_tool = None
+        cfs._connect_init(0x01)
+        assert cfs._active_tool == 1
+
+    def test_connect_init_leaves_active_tool_when_disabled(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x02
+        cfs._active_tool = None
+        cfs._connect_init(0x01)
+        assert cfs._active_tool is None
