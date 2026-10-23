@@ -276,3 +276,31 @@ class TestPathDetection:
         cfs._active_tool = None
         cfs._connect_init(0x01)
         assert cfs._active_tool is None
+
+
+class TestDetectClearsAfterRunout:
+    def test_clear_path_and_empty_toolhead_clears_active_tool(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x00
+        cfs._active_tool = 2
+        cfs._toolhead_filament_detected = lambda: False
+        gcmd = _gcmd()
+        cfs.cmd_CFS_DETECT(gcmd)
+        assert cfs._active_tool is None
+        assert any("active tool cleared" in s for s in _infos(gcmd))
+
+    def test_clear_path_but_filament_at_toolhead_keeps_active_tool(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x00
+        cfs._active_tool = 2
+        cfs._toolhead_filament_detected = lambda: True
+        cfs.cmd_CFS_DETECT(_gcmd())
+        assert cfs._active_tool == 2
+
+    def test_clear_path_without_sensor_keeps_active_tool(self):
+        cfs, hw = _wired()
+        hw.path_flag = 0x00
+        cfs._active_tool = 1
+        cfs._toolhead_filament_detected = lambda: None
+        cfs.cmd_CFS_DETECT(_gcmd())
+        assert cfs._active_tool == 1

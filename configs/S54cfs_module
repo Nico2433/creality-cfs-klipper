@@ -1,0 +1,19 @@
+#!/bin/sh
+# Keep the Creality CFS Klipper module linked into Klipper. The real file lives with the
+# printer config (backed up with it); a SimpleAF/Klipper update can remove the link, so it is
+# recreated on every boot before Klipper starts (S55klipper_service).
+SRC=/usr/data/printer_data/config/cfs/creality_cfs.py
+DST=/usr/data/klipper/klippy/extras/creality_cfs.py
+
+case "$1" in
+  start|restart|reload|"")
+    if [ -f "$SRC" ] && [ "$(readlink "$DST" 2>/dev/null)" != "$SRC" ]; then
+      rm -f "$DST"
+      ln -s "$SRC" "$DST"
+      echo "cfs: linked $DST -> $SRC"
+    fi
+    ;;
+  stop) ;;
+  *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+exit 0

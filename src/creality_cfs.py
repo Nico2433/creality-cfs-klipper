@@ -3914,6 +3914,12 @@ class CrealityCFS:
         addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
         tool = self.detect_path_slot(addr)
         if tool is None:
+            if self._toolhead_filament_detected() is False and self._active_tool is not None:
+                # Path and toolhead both empty (e.g. the slot ran out): nothing is loaded.
+                self._active_tool = None
+                gcmd.respond_info("CFS_DETECT: box %d path and toolhead are empty; "
+                                  "active tool cleared" % addr)
+                return
             gcmd.respond_info("CFS_DETECT: box %d path is clear (no slot detected)" % addr)
             return
         self._active_tool = tool
