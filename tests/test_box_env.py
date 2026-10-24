@@ -65,3 +65,24 @@ def test_box_sensor_object():
     assert st["temperature"] == 21.0 and st["humidity"] == 63.0
     assert st["measured_min_temp"] == st["measured_max_temp"] == 21.0
     assert sensor.get_temp(0.) == (21.0, 0.)
+
+
+def test_park_guard_runs_before_the_park_command():
+    _, cfs = _wired()
+    calls = []
+    handlers = {"_TOOLHEAD_PARK_PAUSE_CANCEL": lambda g: calls.append("park")}
+
+    def register(name, func, desc=None):
+        if func is None:
+            return handlers.pop(name, None)
+        handlers[name] = func
+    cfs.gcode.register_command.side_effect = register
+    cfs.gcode.run_script_from_command.side_effect = lambda s: calls.append(s)
+    cfs.park_guard = ["_TOOLHEAD_PARK_PAUSE_CANCEL", "_MISSING"]
+    cfs.park_guard_gcode = "_CFS_CHUTE_ESCAPE"
+
+    cfs._install_park_guard()
+    handlers["_TOOLHEAD_PARK_PAUSE_CANCEL"](mock.MagicMock())
+
+    assert calls == ["_CFS_CHUTE_ESCAPE", "park"]
+    assert "_MISSING" not in handlers
