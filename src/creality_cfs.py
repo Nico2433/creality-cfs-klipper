@@ -2889,8 +2889,8 @@ class CrealityCFS:
         return st["code"]
 
     def _recheck_buffer_after_load(self, addr: int) -> None:
-        """Second post-load 0x05 read, BUFFER_SETTLE_S after the load; report only if the
-        buffer is still not in the middle."""
+        """Second post-load 0x05 read, BUFFER_SETTLE_S after the load; logged if the buffer
+        is still not in the middle."""
         if self._shutdown or not self.is_connected:
             return
         try:
@@ -2898,9 +2898,11 @@ class CrealityCFS:
         except Exception:
             logger.exception("creality_cfs: post-load buffer recheck failed")
             return
+        # Log only: the recheck often lands during the chute purge, while the box is still
+        # feeding and the buffer legitimately reads full (seen on the K1 Max).
         if buf is not None and buf["code"] != BUFFER_STATE_MIDDLE:
-            self.gcode.respond_info("CFS: buffer still reads %s %.0f s after the load "
-                                    "(expected middle)" % (buf["state"], BUFFER_SETTLE_S))
+            logger.info("creality_cfs: buffer still reads %s %.0f s after the load",
+                        buf["state"], BUFFER_SETTLE_S)
 
     def cut_state(self, addr: int) -> bool:
         """DEPRECATED bool form: True iff the 0x05 byte reads 0x00 (buffer middle).

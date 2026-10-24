@@ -383,9 +383,9 @@ class TestPostLoadBufferRecheck:
         infos = [c.args[0] for c in gcmd.respond_info.call_args_list]
         assert not any("buffer" in s for s in infos)
         cb, when = cfs.reactor.register_callback.call_args.args
+        cfs.gcode.respond_info.reset_mock()
         cb(when)
-        msgs = [c.args[0] for c in cfs.gcode.respond_info.call_args_list]
-        assert any("still reads full" in m for m in msgs)
+        cfs.gcode.respond_info.assert_not_called()      # logged, not shown on the console
 
     def test_recheck_is_quiet_once_the_buffer_settles(self):
         cfs, hw = _wired()
