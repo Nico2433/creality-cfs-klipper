@@ -252,6 +252,7 @@ Resolved in v1.2.0:
 import json
 import logging
 import os
+import re
 import struct
 
 # ---------------------------------------------------------------------------
@@ -4184,6 +4185,77 @@ _AFC_LANE_KEYS = ("material", "color", "weight", "spool_id", "extruder_temp", "b
 
 SLICER_TAIL_BYTES: int = 512 * 1024   # OrcaSlicer/PrusaSlicer write their settings block at the end
 COLOR_CLOSE_DIST: float = 60.0        # RGB distance under which two colours count as the same
+FIRST_LAYER_SCAN_BYTES: int = 8 * 1024 * 1024   # the first layer is near the start of the file
+TOWER_OBJECT_NAME: str = "PRIME_TOWER"
+TOWER_OBJECT_MARGIN: float = 2.0      # mm around an object's box that still counts as the object
+
+
+def _gcode_words(code: str) -> dict:
+    words = {}
+    for word in code.split()[1:]:
+        try:
+            words[word[0].upper()] = float(word[1:])
+        except (ValueError, IndexError):
+            pass
+    return words
+
+
+def first_layer_extra_area(text: str):
+    """Box (x0, y0, x1, y1) of the first layer's extrusions that fall outside every object the
+    file declares with EXCLUDE_OBJECT_DEFINE: the prime/wipe tower and its brim (or a skirt).
+    None when there are none. Adaptive meshing only covers declared objects, so without this
+    the tower prints on the mesh's extrapolated edge."""
+    objects = []
+    x = y = None
+    last_e = 0.
+    relative_e = False
+    layer = 0
+    area = None
+    for line in text.splitlines():
+        if line.startswith(";LAYER_CHANGE"):
+            layer += 1
+            if layer > 1:
+                break
+            continue
+        code = line.split(";", 1)[0].strip()
+        if not code:
+            continue
+        cmd = code.split(None, 1)[0].upper()
+        if cmd == "EXCLUDE_OBJECT_DEFINE":
+            m = re.search(r"POLYGON=(\[\[.*?\]\])", code)
+            if m:
+                try:
+                    pts = json.loads(m.group(1))
+                    objects.append((min(p[0] for p in pts) - TOWER_OBJECT_MARGIN,
+                                    min(p[1] for p in pts) - TOWER_OBJECT_MARGIN,
+                                    max(p[0] for p in pts) + TOWER_OBJECT_MARGIN,
+                                    max(p[1] for p in pts) + TOWER_OBJECT_MARGIN))
+                except (ValueError, TypeError, IndexError):
+                    pass
+            continue
+        if cmd in ("M82", "M83"):
+            relative_e = cmd == "M83"
+            continue
+        if cmd == "G92":
+            last_e = _gcode_words(code).get("E", last_e)
+            continue
+        if cmd not in ("G0", "G1", "G2", "G3"):
+            continue
+        w = _gcode_words(code)
+        x = w.get("X", x)
+        y = w.get("Y", y)
+        extruding = False
+        if "E" in w:
+            extruding = w["E"] > 0 if relative_e else w["E"] > last_e
+            if not relative_e:
+                last_e = w["E"]
+        if not (layer == 1 and extruding and x is not None and y is not None):
+            continue
+        if any(b[0] <= x <= b[2] and b[1] <= y <= b[3] for b in objects):
+            continue
+        area = (x, y, x, y) if area is None else (min(area[0], x), min(area[1], y),
+                                                   max(area[2], x), max(area[3], y))
+    return area
 
 
 def parse_slicer_filaments(text: str) -> list:
@@ -4283,7 +4355,7 @@ class CFSAfcBridge:
         for cmd in ("SET_COLOR", "SET_MATERIAL", "SET_WEIGHT", "SET_SPOOL_ID",
                     "AFC_SET_SPOOL_TEMP", "SET_MAP", "SET_RUNOUT", "CHANGE_TOOL",
                     "TOOL_UNLOAD", "LANE_UNLOAD", "AFC_CLEAR_MESSAGE", "CFS_AUTO_REFILL",
-                    "CFS_LANES", "CFS_AUTO_MAP"):
+                    "CFS_LANES", "CFS_AUTO_MAP", "CFS_TOWER_AREA"):
             self.gcode.register_command(cmd, getattr(self, "cmd_" + cmd),
                                         desc=getattr(self, "cmd_%s_help" % cmd))
 
@@ -4659,6 +4731,38 @@ class CFSAfcBridge:
                 name = os.path.join(sd.sdcard_dirname, name)
             return name
         return sd.file_path() if sd is not None else None
+
+    cmd_CFS_TOWER_AREA_help = ("Declare the first layer's prime tower (extrusions outside the objects) "
+                               "as an object so the adaptive bed mesh covers it. [FILE=] [DRY=1]")
+
+    def cmd_CFS_TOWER_AREA(self, gcmd) -> None:
+        path = self._print_file(gcmd)
+        if not path:
+            gcmd.respond_info("CFS: tower area skipped (no print file)")
+            return
+        try:
+            with open(path, "rb") as f:
+                text = f.read(FIRST_LAYER_SCAN_BYTES).decode("utf-8", "replace")
+        except OSError as e:
+            raise gcmd.error("CFS_TOWER_AREA: cannot read %s: %s" % (path, e))
+        area = first_layer_extra_area(text)
+        if area is None:
+            gcmd.respond_info("CFS: no prime tower on the first layer")
+            return
+        x0, y0, x1, y1 = area
+        gcmd.respond_info("CFS: prime tower area X%.1f-%.1f Y%.1f-%.1f" % (x0, x1, y0, y1))
+        if gcmd.get_int("DRY", 0):
+            return
+        excl = self.printer.lookup_object("exclude_object", None)
+        if excl is None:
+            return
+        names = [o.get("name") for o in excl.get_status(0.).get("objects", [])]
+        if TOWER_OBJECT_NAME in names:
+            return
+        self.gcode.run_script_from_command(
+            "EXCLUDE_OBJECT_DEFINE NAME=%s CENTER=%.3f,%.3f POLYGON=[[%.3f,%.3f],[%.3f,%.3f],"
+            "[%.3f,%.3f],[%.3f,%.3f]]" % (TOWER_OBJECT_NAME, (x0 + x1) / 2, (y0 + y1) / 2,
+                                           x0, y0, x1, y0, x1, y1, x0, y1))
 
     cmd_CFS_AUTO_MAP_help = ("Map the slicer tools of the print (or FILE=) to the CFS slots by "
                              "material and colour. [DRY=1] only reports")
