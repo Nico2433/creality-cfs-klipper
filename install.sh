@@ -126,22 +126,27 @@ edit_printer_cfg() {
   if install_file "$PRINTER_CFG" "$tmp"; then CHANGED_KLIPPER=1; fi
 }
 
-# moonraker.conf: remove our [update_manager creality_cfs] section, then append the new one.
+# moonraker.conf: replace our [update_manager creality_cfs] section where it is, append it when
+# missing, or remove it (empty section).
 edit_moonraker_conf() {
   [ -f "$MOONRAKER_CONF" ] || { say "no moonraker.conf, skipping the updater entry"; return 0; }
   tmp=$(mktemp)
   # the section ends at the next header or blank line, so comments after it are kept
   SECTION=$1 awk '
     BEGIN { section = ENVIRON["SECTION"] }
-    /^\[update_manager creality_cfs\]/ { skip = 1; next }
-    skip && /^[ \t]*$/ { skip = 0; next }
+    /^\[update_manager creality_cfs\]/ {
+      skip = 1
+      if (section != "" && !done) { line[++n] = section; done = 1 }
+      next
+    }
+    skip && /^[ \t]*$/ { skip = 0; if (section != "") line[++n] = $0; next }
     skip && /^\[/ { skip = 0 }
     skip { next }
     { line[++n] = $0 }
     END {
       while (n > 0 && line[n] ~ /^[ \t]*$/) n--
       for (i = 1; i <= n; i++) print line[i]
-      if (section != "") { print ""; print section }
+      if (section != "" && !done) { print ""; print section }
     }' "$MOONRAKER_CONF" > "$tmp"
   if install_file "$MOONRAKER_CONF" "$tmp"; then CHANGED_MOONRAKER=1; fi
 }

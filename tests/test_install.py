@@ -125,6 +125,8 @@ def test_updater_entry_is_replaced_and_comments_kept(tree):
     assert moon.count("[update_manager creality_cfs]") == 1
     assert "/old" not in moon
     assert "# default k1 webcam config\n[include webcam.conf]" in moon
+    # replaced where it was, so a later run does not move it
+    assert moon.index("creality_cfs") < moon.index("# default k1 webcam config")
 
 
 def test_mainline_install(tree):
