@@ -517,6 +517,7 @@ BOX_EVENT_IDLE: int = 0x00         # frame STATUS byte: steady state
 BOX_EVENT_INSERT: int = 0x30       # frame STATUS byte: async insert/update push
 BOX_EVENT_BUSY: int = 0x16         # frame STATUS byte: busy/active (cal or retract in progress)
 BOX_INSERT_PHASE_COMPLETE: int = 0x03
+INSERT_QUIET_S: float = 60.0       # give up on an insert with no 0x30 push for this long
 BOX_BUSY_SUBCODE: int = 0x04       # data[3] value during a 0x16 busy/active state
 
 # ---------------------------------------------------------------------------
@@ -1076,9 +1077,18 @@ class CrealityCFS:
         # does not forget it. K1 Max stock reads 0x00 here when the path is clear; the Hi's
         # meaning of this channel is not wire-confirmed, so it defaults off.
         self.detect_path_on_connect: bool = config.getboolean("detect_path_on_connect", False)
+        # idle_presence_poll: read the slot presence (0x08 ch 0) on every heartbeat. The K1 Max
+        # stock host never does (it only polls 0x0A and follows the box's 0x30 insert pushes);
+        # with the extra reads a freshly inserted spool was not seen to finish its insert.
+        self.idle_presence_poll: bool = config.getboolean("idle_presence_poll", True)
+        # k1max_connect: the K1 Max stock connect burst is only 0x04 [00 01], 0x14,
+        # 0x0D [0f 01], 0x08 [00]. The default (Hi) burst adds 0x0D [00 01] and the all-slot
+        # 0x02/0x03 scan, after which the K1 Max box stopped running its own spool insert.
+        self.k1max_connect: bool = config.getboolean("k1max_connect", False)
         # afc_compat: publish the CFS to Fluidd's AFC panel and keep per-slot filament data
         # (material/colour/tool map/runout slot) with the AFC G-code surface. See CFSAfcBridge.
         self._presence_every = 1            # heartbeat ticks between slot-presence refreshes
+        self._inserting: dict = {}          # addr -> time of the last 0x30 insert push
         self._heartbeat_count = 0
         self._heartbeat_misses = 0
         # (temperature, humidity) per box address from the idle 0x0A replies.
@@ -1200,6 +1210,11 @@ class CrealityCFS:
             self.cmd_CFS_BUFFER,
             desc=self.cmd_CFS_BUFFER_help,
         )
+        self.gcode.register_command(
+            "CFS_TRY",
+            self.cmd_CFS_TRY,
+            desc=self.cmd_CFS_TRY_help,
+        )
         # Stock BOX_* tokens for the box-parity features (auto-refill / same-material /
         # error clear). Named to match the stock box_wrapper G-code surface so UIs and
         # macros written against the Creality box can drive this port unchanged.
@@ -1286,13 +1301,17 @@ class CrealityCFS:
             return self.reactor.NEVER
         if self.is_connected and not self._bus_lock.test():
             self._heartbeat_count += 1
-            refresh = self._heartbeat_count % self._presence_every == 0
+            refresh = (self.idle_presence_poll
+                       and self._heartbeat_count % self._presence_every == 0)
             silent = False
             for entry in self._box_table:
                 if entry.online == BoxAddressEntry.ONLINE_ONLINE:
                     try:
-                        if self.get_box_state(entry.addr, retries=1) is None:
+                        st = self.get_box_state(entry.addr, retries=1)
+                        if st is None:
                             silent = True
+                        elif self._track_insert(entry.addr, st, eventtime):
+                            pass        # the box is pulling a new spool in: stay off the bus
                         elif refresh and entry.addr == 0x01:
                             self.refresh_slot_presence(entry.addr)
                     except Exception:
@@ -1317,6 +1336,46 @@ class CrealityCFS:
         self._connected.clear()
         self._probe_attempts = 0
         self.reactor.register_callback(self._connect_probe)
+
+    def _track_insert(self, addr: int, st: dict, eventtime: float) -> bool:
+        """Follow the box's own insert routine from the 0x0A heartbeat (K1 Max stock trace).
+
+        When a spool is pushed into a slot the box feeds it in by itself and reports the
+        progress as 0x30 pushes whose data is a per-slot phase array (e.g. 00 00 02 00 ->
+        00 00 01 00 -> 00 00 03 00 for slot 3; 0x03 = done). The stock host sends nothing
+        while that runs, only its 0x0A poll, and on phase 0x03 reads that slot's RFID (0x02)
+        and remain (0x03). Returns True while an insert is in progress, so the heartbeat
+        skips its own 0x08 presence read until the box is done."""
+        if st.get("event") == BOX_EVENT_INSERT:
+            raw = st.get("raw", b"")
+            for idx in range(min(4, len(raw))):
+                phase = raw[idx]
+                if not phase:
+                    continue
+                if phase != BOX_INSERT_PHASE_COMPLETE:
+                    if self._inserting.get(addr) is None:
+                        self.gcode.respond_info("CFS: slot%d filament detected, the box is "
+                                                "pulling it in" % (idx + 1))
+                    logger.info("creality_cfs: box 0x%02X insert slot%d phase 0x%02X (push %s)",
+                                addr, idx + 1, phase, raw.hex())
+                    self._inserting[addr] = eventtime
+                    continue
+                self._inserting.pop(addr, None)
+                mask = SLOT_BITMASKS[idx]
+                mat = self.read_material(addr, mask, timeout=5.0)
+                rem = self.read_remain(addr, mask, timeout=5.0)
+                self._ingest_slot_reads(mat, rem, mask)
+                slot = self._slots.get(idx, {})
+                logger.info("creality_cfs: box 0x%02X insert slot%d done material=%s",
+                            addr, idx + 1, mat)
+                self.gcode.respond_info("CFS: slot%d filament loaded into the box (%s)" % (
+                    idx + 1, slot.get("material") or "no tag"))
+            return addr in self._inserting
+        started = self._inserting.get(addr)
+        if started is not None and eventtime - started > INSERT_QUIET_S:
+            self._inserting.pop(addr, None)     # no completion push seen: resume the reads
+            logger.warning("creality_cfs: box 0x%02X insert did not report completion", addr)
+        return addr in self._inserting
 
     def refresh_slot_presence(self, addr: int) -> None:
         """Update the per-slot `present` cache from 0x08 channel 0 (bitmask of slots with
@@ -1397,10 +1456,17 @@ class CrealityCFS:
                 sn = self.get_version_sn(addr)
             except Exception:
                 sn = None
-            self._run_preload_sequence(addr)
-            mat = self.read_material(addr, PRELOAD_MASK_ALL, timeout=15.0)
-            rem = self.read_remain(addr, PRELOAD_MASK_ALL, timeout=15.0)
-            self._ingest_slot_reads(mat, rem)
+            if self.k1max_connect:
+                if not self.set_pre_loading(addr, PRELOAD_MASK_ALL, 0x01,
+                                            timeout=PRELOAD_PHASE1_TIMEOUT_S, retries=1):
+                    logger.warning("creality_cfs: pre-load [0f 01] not ACKed on 0x%02X", addr)
+                self._preload_done[addr] = True
+                self.refresh_slot_presence(addr)                # 0x08 [00] slot mask
+            else:
+                self._run_preload_sequence(addr)
+                mat = self.read_material(addr, PRELOAD_MASK_ALL, timeout=15.0)
+                rem = self.read_remain(addr, PRELOAD_MASK_ALL, timeout=15.0)
+                self._ingest_slot_reads(mat, rem)
             logger.info("creality_cfs: box 0x%02X connect-init done sn=%s slots=%s",
                         addr, sn, self._slots)
             if self.detect_path_on_connect and self._active_tool is None:
@@ -2865,6 +2931,9 @@ class CrealityCFS:
 
         data_bytes = resp.get("data", b"")
         flag = data_bytes[0] if len(data_bytes) >= 1 else 0xFF
+        if resp.get("status") not in (None, 0x00):
+            logger.info("creality_cfs: GET_HARDWARE_STATUS addr=0x%02X ch=0x%02X reply status "
+                        "0x%02X data=%s", addr, channel, resp.get("status"), data_bytes.hex())
         (logger.debug if quiet else logger.info)(
             "creality_cfs: GET_HARDWARE_STATUS addr=0x%02X ch=0x%02X flag=0x%02X", addr, channel, flag
         )
@@ -4064,6 +4133,26 @@ class CrealityCFS:
             return
         self._active_tool = tool
         gcmd.respond_info("CFS_DETECT: box %d path holds slot T%d; active tool set" % (addr, tool))
+
+    cmd_CFS_TRY_help: str = (
+        "Run one command (CMD=, no arguments) and report its error instead of raising it, "
+        "so the macro calling it goes on (e.g. a failed unload must not stop CANCEL_PRINT)."
+    )
+
+    def cmd_CFS_TRY(self, gcmd) -> None:
+        """G-code: CFS_TRY CMD=<command> -- an error inside CMD is reported, not raised.
+
+        A macro stops at the first error. CANCEL_PRINT calls the CFS unload before
+        CANCEL_PRINT_BASE, so a jammed unload used to abort the cancel and the print went on
+        printing. Wrapped in CFS_TRY the unload can fail and the cancel still completes."""
+        cmd = gcmd.get("CMD").strip()
+        if not cmd or " " in cmd:
+            raise gcmd.error("CFS_TRY: CMD must be one command name without arguments")
+        try:
+            self.gcode.run_script_from_command(cmd)
+        except gcmd.error as exc:
+            logger.warning("creality_cfs: CFS_TRY %s failed: %s", cmd, exc)
+            gcmd.respond_raw("!! CFS: %s failed (%s); continuing" % (cmd, exc))
 
     cmd_CFS_BUFFER_help: str = (
         "Read the filament buffer position from the CFS (0x05): middle/full/empty. "

@@ -87,6 +87,18 @@ class TestConnectInit:
             assert cfs._slots[idx]["material"] is None
             assert cfs._slots[idx]["remain"] == -1
 
+    def test_k1max_connect_sends_only_the_stock_k1max_burst(self):
+        hw, cfs, _ = _wired()
+        cfs.k1max_connect = True
+        before = len(hw.get_received_funcs())
+
+        cfs._connect_init(0x01)
+
+        funcs = hw.get_received_funcs()[before:]
+        assert funcs == [CMD_SET_BOX_MODE, CMD_GET_VERSION_SN, CMD_SET_PRE_LOADING,
+                         CMD_GET_HARDWARE_STATUS]
+        assert cfs._preload_done[0x01] is True
+
     def test_connect_init_never_raises_on_silent_box(self):
         hw, cfs, _ = _wired()
         # every command times out -> the burst must swallow it, not raise
