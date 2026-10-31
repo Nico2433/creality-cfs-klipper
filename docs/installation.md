@@ -44,7 +44,7 @@ cp creality_cfs.py ~/klipper/klippy/extras/creality_cfs.py
 cp cfs_macros.cfg ~/printer_data/config/cfs_macros.cfg
 # K1 Max: use cfs_k1max.cfg INSTEAD of cfs_macros.cfg (both define T0-T3);
 # see "K1 Max install" in INSTALL.md
-# K1 Max on SimpleAF: modules go to config/cfs/ instead;
+# K1 Max on SimpleAF: clone the repo to /usr/data/creality-cfs-klipper instead;
 # see "K1 Max with SimpleAF" in INSTALL.md
 
 # Optional: example config, for reference only

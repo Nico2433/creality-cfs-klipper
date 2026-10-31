@@ -1,8 +1,9 @@
 #!/bin/sh
-# Keep the Creality CFS Klipper modules linked into Klipper. The real files live with the
-# printer config (backed up with it); a SimpleAF/Klipper update can remove the links, so they
-# are recreated on every boot before Klipper starts (S55klipper_service).
-SRC_DIR=/usr/data/printer_data/config/cfs
+# Keep the Creality CFS Klipper modules linked into Klipper. The code lives in a git checkout
+# of this repo outside the printer config (Moonraker's update_manager updates it); a
+# SimpleAF/Klipper update can remove the links, so they are recreated on every boot before
+# Klipper starts (S55klipper_service).
+SRC_DIR=/usr/data/creality-cfs-klipper/src
 DST_DIR=/usr/data/klipper/klippy/extras
 
 case "$1" in

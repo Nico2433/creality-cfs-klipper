@@ -345,25 +345,25 @@ Tested on a K1 Max running SimpleAF with an Eddy probe (EddyNG). The probe is si
 
 Step 3 of the K1 Max install still applies, and so does the `[stepper_y]` `position_max` from step 2. The hooks below replace step 4, and the overlay sets the aux fan of step 5.
 
-1. Put the module and the extra with the config, so they are backed up with it:
+1. Clone this repo outside the printer config, so Fluidd only shows `.cfg` files and Moonraker can update the code. Then copy the two config files:
 
    ```bash
+   git clone --branch k1-simpleaf https://github.com/Nico2433/creality-cfs-klipper.git /usr/data/creality-cfs-klipper
+   cp /usr/data/creality-cfs-klipper/configs/cfs_k1max.cfg /usr/data/creality-cfs-klipper/configs/cfs_k1max_simpleaf.cfg /usr/data/printer_data/config/
    mkdir -p /usr/data/printer_data/config/cfs
-   cp src/creality_cfs.py src/abortable_waits.py /usr/data/printer_data/config/cfs/
-   cp configs/cfs_k1max.cfg configs/cfs_k1max_simpleaf.cfg /usr/data/printer_data/config/
    ```
 
-   `cfs/` also holds `lane_data_file` (`cfs_lanes.json`).
+   `config/cfs/` only holds `lane_data_file` (`cfs_lanes.json`).
 
-2. Link them into Klipper on every boot. A SimpleAF or Klipper update can remove the links; `S54cfs_module` recreates them before Klipper starts (`S55klipper_service`):
+2. Link the module and the extra into Klipper on every boot. A SimpleAF or Klipper update can remove the links; `S54cfs_module` recreates them before Klipper starts (`S55klipper_service`):
 
    ```bash
-   cp configs/S54cfs_module /etc/init.d/
+   cp /usr/data/creality-cfs-klipper/configs/S54cfs_module /etc/init.d/
    chmod +x /etc/init.d/S54cfs_module
    /etc/init.d/S54cfs_module start
    ```
 
-   It links `creality_cfs.py` and `abortable_waits.py` from `/usr/data/printer_data/config/cfs/` into `/usr/data/klipper/klippy/extras/`.
+   It links `creality_cfs.py` and `abortable_waits.py` from `/usr/data/creality-cfs-klipper/src/` into `/usr/data/klipper/klippy/extras/`.
 
 3. In `/usr/data/printer_data/config/printer.cfg`, below the SimpleAF includes (in place of any earlier `[include cfs.cfg]`):
 
@@ -374,7 +374,20 @@ Step 3 of the K1 Max install still applies, and so does the `[stepper_y]` `posit
 
    The order matters: `fan_control.cfg` and `client.cfg` must come before both, because the overlay replaces their `M141`/`M191` and the `runout_sensor` of `_CLIENT_VARIABLE`.
 
-4. Restart Klipper.
+4. Let Moonraker update the module from Fluidd/Mainsail. In `/usr/data/printer_data/config/moonraker.conf`:
+
+   ```ini
+   [update_manager creality_cfs]
+   type: git_repo
+   path: /usr/data/creality-cfs-klipper
+   origin: https://github.com/Nico2433/creality-cfs-klipper.git
+   primary_branch: k1-simpleaf
+   managed_services: klipper
+   ```
+
+   An update pulls the code and restarts Klipper. The two `.cfg` files in `config/` are copies: after an update that changes them, copy them again. SimpleAF regenerates `moonraker.conf` and `printer.cfg` on its own updates, so save your changes with its config overrides first.
+
+5. Restart Moonraker and Klipper.
 
 What the overlay sets:
 
@@ -408,13 +421,11 @@ GrumpyScreen: `configs/grumpyscreen_k1max.ini` points Load at `CFS_MENU` and Unl
 
 Test prints: `configs/cfs_test_2colores.gcode` (two colours), `cfs_test_runout.gcode` (runout, recovery on another slot) and `cfs_test_refill.gcode` (auto-refill; send `_ON_FILAMENT_RUNOUT` from the console during layer 1).
 
-#### Deploy through Moonraker
+#### Deploy without SSH
 
-Instead of SSH, upload with Moonraker's file API (`<printer>` is the printer's address):
+With the git checkout, the code updates from Fluidd/Mainsail (step 4). The `.cfg` files can be uploaded through Moonraker's file API (`<printer>` is the printer's address):
 
 ```bash
-curl -F file=@src/creality_cfs.py -F root=config -F path=cfs http://<printer>:7125/server/files/upload
-curl -F file=@src/abortable_waits.py -F root=config -F path=cfs http://<printer>:7125/server/files/upload
 curl -F file=@configs/cfs_k1max_simpleaf.cfg -F root=config http://<printer>:7125/server/files/upload
 curl -X POST "http://<printer>:7125/machine/services/restart?service=klipper"
 ```
