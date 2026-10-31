@@ -298,7 +298,8 @@ Tested on a K1 Max running plain Klipper with the stock CFS (firmware 2.3.5.34, 
 
    ```bash
    cp src/creality_cfs.py ~/klipper/klippy/extras/
-   cp configs/cfs_k1max.cfg <your printer.cfg directory>/
+   mkdir -p <your printer.cfg directory>/macros
+   cp configs/cfs_k1max.cfg <your printer.cfg directory>/macros/
    ```
 
    `cfs_k1max.cfg` contains `[respond]`, which mainline Klipper needs for the macros' `RESPOND` messages (the `CFS_MENU` dialog, the cut-switch messages). Without it every `RESPOND` fails with `Unknown command:"RESPOND"`. Kalico loads `respond` on its own.
@@ -306,7 +307,7 @@ Tested on a K1 Max running plain Klipper with the stock CFS (firmware 2.3.5.34, 
 2. In `printer.cfg`, include it and make room for the cut:
 
    ```ini
-   [include cfs_k1max.cfg]
+   [include macros/cfs_k1max.cfg]
 
    [stepper_y]
    position_max: 307.5   # must be >= 306: the cut presses at Y306 (stock 307.5)
@@ -349,8 +350,8 @@ Step 3 of the K1 Max install still applies, and so does the `[stepper_y]` `posit
 
    ```bash
    git clone --branch k1-simpleaf https://github.com/Nico2433/creality-cfs-klipper.git /usr/data/creality-cfs-klipper
-   cp /usr/data/creality-cfs-klipper/configs/cfs_k1max.cfg /usr/data/creality-cfs-klipper/configs/cfs_k1max_simpleaf.cfg /usr/data/printer_data/config/
-   mkdir -p /usr/data/printer_data/config/cfs
+   mkdir -p /usr/data/printer_data/config/macros /usr/data/printer_data/config/cfs
+   cp /usr/data/creality-cfs-klipper/configs/cfs_k1max.cfg /usr/data/creality-cfs-klipper/configs/cfs_k1max_simpleaf.cfg /usr/data/printer_data/config/macros/
    ```
 
    `config/cfs/` only holds `lane_data_file` (`cfs_lanes.json`).
@@ -368,8 +369,8 @@ Step 3 of the K1 Max install still applies, and so does the `[stepper_y]` `posit
 3. In `/usr/data/printer_data/config/printer.cfg`, below the SimpleAF includes (in place of any earlier `[include cfs.cfg]`):
 
    ```ini
-   [include cfs_k1max.cfg]
-   [include cfs_k1max_simpleaf.cfg]
+   [include macros/cfs_k1max.cfg]
+   [include macros/cfs_k1max_simpleaf.cfg]
    ```
 
    The order matters: `fan_control.cfg` and `client.cfg` must come before both, because the overlay replaces their `M141`/`M191` and the `runout_sensor` of `_CLIENT_VARIABLE`.
@@ -385,7 +386,7 @@ Step 3 of the K1 Max install still applies, and so does the `[stepper_y]` `posit
    managed_services: klipper
    ```
 
-   An update pulls the code and restarts Klipper. The two `.cfg` files in `config/` are copies: after an update that changes them, copy them again. SimpleAF regenerates `moonraker.conf` and `printer.cfg` on its own updates, so save your changes with its config overrides first.
+   An update pulls the code and restarts Klipper. The two `.cfg` files in `config/macros/` are copies: after an update that changes them, copy them again. SimpleAF regenerates `moonraker.conf` and `printer.cfg` on its own updates, so save your changes with its config overrides first.
 
 5. Restart Moonraker and Klipper.
 
@@ -426,7 +427,7 @@ Test prints: `configs/cfs_test_2colores.gcode` (two colours), `cfs_test_runout.g
 With the git checkout, the code updates from Fluidd/Mainsail (step 4). The `.cfg` files can be uploaded through Moonraker's file API (`<printer>` is the printer's address):
 
 ```bash
-curl -F file=@configs/cfs_k1max_simpleaf.cfg -F root=config http://<printer>:7125/server/files/upload
+curl -F file=@configs/cfs_k1max_simpleaf.cfg -F root=config -F path=macros http://<printer>:7125/server/files/upload
 curl -X POST "http://<printer>:7125/machine/services/restart?service=klipper"
 ```
 

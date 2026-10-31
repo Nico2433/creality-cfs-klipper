@@ -256,7 +256,7 @@ extrude_temp: 220
 #   [include cfs_macros.cfg]
 #
 # Place cfs_macros.cfg in the same directory as printer.cfg. cfs_macros.cfg is
-# the Hi macro set; on a K1 Max use [include cfs_k1max.cfg] instead.
+# the Hi macro set; on a K1 Max use [include macros/cfs_k1max.cfg] instead.
 #
 # Mainline Klipper: the macros use RESPOND, which needs a [respond] section.
 # cfs_k1max.cfg contains one; cfs_macros.cfg does not, so with it add:
