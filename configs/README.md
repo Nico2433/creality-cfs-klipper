@@ -60,6 +60,16 @@ To use the macros, add this line to `printer.cfg`:
 
 Ensure `cfs_macros.cfg` is in the same directory as `printer.cfg` (typically `~/printer_data/config/`).
 
+### K1 Max
+
+- `cfs_k1max.cfg`: generic K1 Max config (plain Klipper), used instead of `cfs_macros.cfg`.
+- `cfs_k1max_simpleaf.cfg`: SimpleAF overlay; include it right after `cfs_k1max.cfg`.
+  It needs the `abortable_waits.py` extra next to `creality_cfs.py`.
+- `S54cfs_module`: SimpleAF init script that links both extras into `klippy/extras` on boot.
+- `grumpyscreen_k1max.ini`: GrumpyScreen config (Load button opens `CFS_MENU`).
+- `SLICER_GCODE_K1MAX.md`: slicer start/end/change G-code for SimpleAF.
+- `cfs_test_*.gcode`: hardware test prints (two colours, runout, auto-refill) for SimpleAF.
+
 ## See Also
 
 - [Installation guide](../docs/installation.md)

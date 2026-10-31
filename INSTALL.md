@@ -274,6 +274,10 @@ extrude_temp: 220
 #afc_compat: False
 #lane_data_file: <printer.cfg directory>/cfs_lanes.json
 #afc_extruder: extruder
+
+# Park guard (cfs_k1max_simpleaf.cfg sets both); empty by default, which wraps nothing.
+#park_guard:          # comma-separated commands; park_guard_gcode runs right before each
+#park_guard_gcode:    # G-code run first, e.g. _CFS_CHUTE_ESCAPE; empty = off
 ```
 
 > 💡 **Prefer `by-id` paths over `/dev/ttyUSB0`** when using USB adapters. `ttyUSB0` can shift when you plug in other USB devices. `ls /dev/serial/by-id/` to find your adapter's stable path.
@@ -332,6 +336,90 @@ Tested on a K1 Max running plain Klipper with the stock CFS (firmware 2.3.5.34, 
 6. Restart Klipper. With `heartbeat_interval: 4` the box front LEDs stop blinking red, and `box_sensor: cfs_box` publishes the box temperature and humidity as `temperature_sensor cfs_box`.
 
 The tool change runs: z-hop, cut, lift to Z30, unload to the box, move to the rear purge chute (185, 305.5) by way of Y291.5, load the new slot, purge, back to the print. The stock nozzle wipe is skipped (see the header of `cfs_k1max.cfg`).
+
+### K1 Max with SimpleAF
+
+SimpleAF is Pellcorp's Kalico-based K1 firmware. Its `START_PRINT`, `END_PRINT`, `CANCEL_PRINT`, `RESUME` and runout handling call `_SAF_*` hook macros; `configs/cfs_k1max_simpleaf.cfg` maps them to the CFS calls. It is an overlay on `cfs_k1max.cfg`: Klipper merges a repeated section option by option and the later value wins, so the overlay only adds or overrides the SimpleAF pieces.
+
+Tested on a K1 Max running SimpleAF with an Eddy probe (EddyNG). The probe is side-mounted and hits the cleaning station behind the chute, which is why the stock nozzle wipe is skipped.
+
+Step 3 of the K1 Max install still applies, and so does the `[stepper_y]` `position_max` from step 2. The hooks below replace step 4, and the overlay sets the aux fan of step 5.
+
+1. Put the module and the extra with the config, so they are backed up with it:
+
+   ```bash
+   mkdir -p /usr/data/printer_data/config/cfs
+   cp src/creality_cfs.py src/abortable_waits.py /usr/data/printer_data/config/cfs/
+   cp configs/cfs_k1max.cfg configs/cfs_k1max_simpleaf.cfg /usr/data/printer_data/config/
+   ```
+
+   `cfs/` also holds `lane_data_file` (`cfs_lanes.json`).
+
+2. Link them into Klipper on every boot. A SimpleAF or Klipper update can remove the links; `S54cfs_module` recreates them before Klipper starts (`S55klipper_service`):
+
+   ```bash
+   cp configs/S54cfs_module /etc/init.d/
+   chmod +x /etc/init.d/S54cfs_module
+   /etc/init.d/S54cfs_module start
+   ```
+
+   It links `creality_cfs.py` and `abortable_waits.py` from `/usr/data/printer_data/config/cfs/` into `/usr/data/klipper/klippy/extras/`.
+
+3. In `/usr/data/printer_data/config/printer.cfg`, below the SimpleAF includes (in place of any earlier `[include cfs.cfg]`):
+
+   ```ini
+   [include cfs_k1max.cfg]
+   [include cfs_k1max_simpleaf.cfg]
+   ```
+
+   The order matters: `fan_control.cfg` and `client.cfg` must come before both, because the overlay replaces their `M141`/`M191` and the `runout_sensor` of `_CLIENT_VARIABLE`.
+
+4. Restart Klipper.
+
+What the overlay sets:
+
+| Section | Does |
+|---|---|
+| `_SAF_START_PRINT_START` | chamber target, `CFS_AUTO_MAP`, toolhead switch on, `CFS_FEEDER ENABLE=1` (a missing filament fails before the heat soak) |
+| `_SAF_START_PRINT_BEFORE_BED_MESH` | `CFS_TOWER_AREA` (the adaptive mesh covers the prime tower), chamber wait |
+| `_SAF_START_PRINT_BEFORE_LINE_PURGE` | side fan off, `CFS_TOOL` for `INITIAL_TOOL` |
+| `_SAF_END_PRINT_START` | `CFS_PRINT_END` (filament back to the box), chamber reset |
+| `_SAF_ON_CANCEL` | `CFS_PRINT_CANCEL`, chamber reset |
+| `_SAF_ON_FILAMENT_RUNOUT` | `_CFS_ON_RUNOUT_RUN` (SimpleAF has already paused) |
+| `_SAF_ON_RESUME` | `CFS_RESUME_CHECK` |
+| `[filament_switch_sensor filament_sensor_2]` | `runout_gcode: _ON_FILAMENT_RUNOUT`, SimpleAF's handler |
+| `_CLIENT_VARIABLE` | `runout_sensor: ""`: the stock rear sensor is out of the CFS path, so SimpleAF's own check is off |
+| `_CFS_SETTINGS` | `aux_fan: "auxiliary"`, SimpleAF's side fan, off during a colour change |
+| `[creality_cfs]` | `park_guard: _TOOLHEAD_PARK_PAUSE_CANCEL, _TOOLHEAD_PARK_END_PRINT` and `park_guard_gcode: _CFS_CHUTE_ESCAPE`: the toolhead leaves the chute along Y before SimpleAF parks it |
+| `[abortable_waits]` | a cancel stops the print start's heating and soak waits |
+| `_WARP_STABILISE` | SimpleAF's bed soak, with `ABORTABLE_WAIT` instead of `G4` |
+| `M141` / `M191` | chamber target / set and wait. The K1 Max has no chamber heater: the target is where `temperature_fan chamber_fan` starts, and the bed heats the chamber |
+
+`park_guard` / `park_guard_gcode` (`[creality_cfs]`): a load or purge that fails at the chute leaves the toolhead there, and `CANCEL_PRINT`/`PAUSE` then park diagonally across the cleaning station. At connect the module wraps each command listed in `park_guard` (comma-separated) so `park_guard_gcode` runs right before it. A listed command that does not exist is logged and skipped. Both default to empty, which wraps nothing.
+
+`[abortable_waits]` (no options; needs `abortable_waits.py`): a `CANCEL_PRINT` from the web UI or the touchscreen normally queues behind the whole `START_PRINT`. With this section, `M109`, `M190` and `TEMPERATURE_WAIT` check for a cancel every second and stop with `Print cancelled`, and `ABORTABLE_WAIT SECONDS=` is a dwell that does the same. A command that a `gcode_macro` already overrides is left alone. Limits:
+
+- It uses Klipper/Kalico internals (`webhooks._endpoints`, `heaters._get_temp`, `gcode.gcode_help`, the `gcode/script` endpoint). If one is missing, Klipper stops with a config error naming it: remove `[abortable_waits]`.
+- Its `TEMPERATURE_WAIT` ignores Kalico's `ALLOW_CANCEL` parameter.
+
+Slicer G-code: `START_PRINT` must pass `INITIAL_TOOL`, and the change-filament G-code sets the next temperature and purge length. The lines for OrcaSlicer, Creality Print and PrusaSlicer are in [configs/SLICER_GCODE_K1MAX.md](configs/SLICER_GCODE_K1MAX.md).
+
+GrumpyScreen: `configs/grumpyscreen_k1max.ini` points Load at `CFS_MENU` and Unload at `CFS_UNLOAD`, and shows `temperature_sensor cfs_box`. Copy it over `/usr/data/printer_data/config/grumpyscreen.ini` and run `/etc/init.d/S99guppyscreen restart`.
+
+Test prints: `configs/cfs_test_2colores.gcode` (two colours), `cfs_test_runout.gcode` (runout, recovery on another slot) and `cfs_test_refill.gcode` (auto-refill; send `_ON_FILAMENT_RUNOUT` from the console during layer 1).
+
+#### Deploy through Moonraker
+
+Instead of SSH, upload with Moonraker's file API (`<printer>` is the printer's address):
+
+```bash
+curl -F file=@src/creality_cfs.py -F root=config -F path=cfs http://<printer>:7125/server/files/upload
+curl -F file=@src/abortable_waits.py -F root=config -F path=cfs http://<printer>:7125/server/files/upload
+curl -F file=@configs/cfs_k1max_simpleaf.cfg -F root=config http://<printer>:7125/server/files/upload
+curl -X POST "http://<printer>:7125/machine/services/restart?service=klipper"
+```
+
+After a `.py` change restart the Klipper service, not just `FIRMWARE_RESTART`. `/etc/init.d/` is outside Moonraker's roots, so installing `S54cfs_module` needs SSH once.
 
 ---
 

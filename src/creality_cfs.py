@@ -1059,6 +1059,12 @@ class CrealityCFS:
         # CFS_CUT checks the switch reads PRESSED at the cut position (stock confirms every
         # cut this way) and raises a recoverable error after backing off if it does not.
         self.cut_switch_button = config.get("cut_switch_button", None)
+        # park_guard / park_guard_gcode: run park_guard_gcode before each listed command (the
+        # client's park macros). A load or purge that fails at the chute leaves the toolhead
+        # there, and CANCEL_PRINT/PAUSE park diagonally from it; the guard macro can move it out
+        # of the chute first. Empty disables.
+        self.park_guard = [c.strip() for c in config.get("park_guard", "").split(",") if c.strip()]
+        self.park_guard_gcode = config.get("park_guard_gcode", "")
         # heartbeat_interval: seconds between idle GET_BOX_STATE (0x0A) polls of every online
         # box; 0 disables. The K1 Max stock host polls every ~4 s, and without it the box's
         # front LEDs blink red as if no host were attached. Skipped while a command holds
@@ -1142,6 +1148,7 @@ class CrealityCFS:
 
         # --- Register Klipper lifecycle handlers ---
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
+        self.printer.register_event_handler("klippy:connect", self._install_park_guard)
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
         self.printer.register_event_handler("klippy:disconnect", self._handle_shutdown)
 
@@ -1264,6 +1271,23 @@ class CrealityCFS:
     # -----------------------------------------------------------------------
     # Klipper lifecycle handlers
     # -----------------------------------------------------------------------
+
+    def _install_park_guard(self) -> None:
+        """Wrap each park_guard command so park_guard_gcode runs right before it."""
+        if not self.park_guard_gcode:
+            return
+        for name in self.park_guard:
+            original = self.gcode.register_command(name, None)
+            if original is None:
+                logger.warning("creality_cfs: park_guard: command %s not found", name)
+                continue
+            desc = getattr(self.gcode, "gcode_help", {}).get(name)
+
+            def guarded(gcmd, original=original):
+                self.gcode.run_script_from_command(self.park_guard_gcode)
+                original(gcmd)
+            self.gcode.register_command(name, guarded, desc=desc)
+            logger.info("creality_cfs: park_guard: %s runs %s first", name, self.park_guard_gcode)
 
     def _exclusive(self, handler):
         """Mark a multi-frame box choreography as running, so the idle heartbeat does not

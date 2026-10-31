@@ -28,6 +28,10 @@ RS485 protocol (see [Unreleased]).
 - **`CFS_TRY CMD=<command>`**: runs one command and reports its error without aborting the calling macro, so a failed unload in `CANCEL_PRINT` cannot stop the cancel.
 - **`CFS_FEEDER ENABLE=0|1`**, **`CFS_DETECT`** and **`CFS_BUFFER`**; with `afc_compat`, the AFC G-code surface for Fluidd plus `CFS_LANES`, `CFS_AUTO_MAP`, `CFS_AUTO_REFILL` and `CFS_TOWER_AREA`. See `docs/commands.md`.
 - **`[respond]` in `cfs_k1max.cfg`**: mainline Klipper needs it for the macros' `RESPOND` messages (Kalico loads it on its own). `cfs_macros.cfg` has none; `INSTALL.md` says to add it. Both files load and every macro renders on mainline Klipper 0cee841e (Python 3.8) and Kalico 488b45d5 (Python 3.9).
+- **SimpleAF overlay, `configs/cfs_k1max_simpleaf.cfg`**: included after `cfs_k1max.cfg` on a K1 Max running SimpleAF (Pellcorp's Kalico-based firmware). Maps the `_SAF_*` hooks to the CFS print hooks, sets `park_guard`, `[abortable_waits]`, chamber `M141`/`M191`, `_WARP_STABILISE` with `ABORTABLE_WAIT` and the aux fan `auxiliary`. Tested with an Eddy probe. See `INSTALL.md` "K1 Max with SimpleAF".
+- **`park_guard` / `park_guard_gcode`** (`[creality_cfs]`): run `park_guard_gcode` right before each listed command. Both default to empty, which wraps nothing.
+- **`[abortable_waits]`** (`src/abortable_waits.py`): a print cancel stops `M109`, `M190`, `TEMPERATURE_WAIT` and the new `ABORTABLE_WAIT SECONDS=` dwell. Fails with a config error when a Klipper/Kalico internal it needs is missing; its `TEMPERATURE_WAIT` ignores Kalico's `ALLOW_CANCEL`.
+- **Restored SimpleAF helper files** (removed on `k1-support`): `configs/S54cfs_module` (init script that relinks the extras from `config/cfs/` on boot), `configs/SLICER_GCODE_K1MAX.md`, `configs/grumpyscreen_k1max.ini` and the test prints `configs/cfs_test_2colores.gcode`, `cfs_test_runout.gcode`, `cfs_test_refill.gcode`.
 - **Box temperature and humidity**: on the K1 Max the 0x0A reply carries °C in b0 and %RH in b1; `box_sensor` publishes them as a `temperature_sensor`.
 
 ### Fixed

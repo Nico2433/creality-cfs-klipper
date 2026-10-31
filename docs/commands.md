@@ -406,6 +406,23 @@ Parameters:
 
 ---
 
+### ABORTABLE_WAIT
+
+From `[abortable_waits]` (`src/abortable_waits.py`), not from `creality_cfs`.
+A dwell like `G4` that stops with `Print cancelled` when a cancel is requested,
+so a soak loop in `START_PRINT` does not hold back `CANCEL_PRINT`. The same
+section makes `M109`, `M190` and `TEMPERATURE_WAIT` stop on a cancel; see
+"K1 Max with SimpleAF" in `INSTALL.md`.
+
+```
+ABORTABLE_WAIT SECONDS=30
+```
+
+Parameters:
+- `SECONDS`: dwell time (required, >= 0)
+
+---
+
 ### AFC bridge commands (`afc_compat: True`)
 
 With `afc_compat: True` the module registers the AFC objects Fluidd's panel
@@ -471,6 +488,7 @@ which is why an unload could never be confirmed on real hardware.
 | `CFS_DETECT` | 0x08 ch 0x01 | Wire-confirmed on a K1 Max; the Hi meaning of this channel is not confirmed |
 | `CFS_BUFFER` | 0x05 | Wire-confirmed |
 | `CFS_TRY` | n/a | Local wrapper |
+| `ABORTABLE_WAIT` | n/a | Local dwell (`[abortable_waits]`) |
 | internal: slot presence | 0x02 READ_MATERIAL, 0x03 READ_REMAIN | Wire-confirmed; used by the connect init and the slot cache (no dedicated g-code) |
 | internal: buffer state | 0x0C GET_BUFFER_STATE (buffer node 0x81+) | Wire-confirmed; 8-byte block, all-zero = empty |
 | internal: RFID/material label | shares 0x02 | Tag-label byte decode pending a tagged-spool capture |

@@ -158,6 +158,11 @@ extrude_temp: 220
 #   When the buffer (0x05) is not at middle right after a load, read it again
 #   after this many seconds and log it, instead of reporting it at once; 0 = off
 #   (K1 Max: 7).
+#park_guard:
+#park_guard_gcode:
+#   Comma-separated commands (e.g. park macros) to wrap: park_guard_gcode runs
+#   before each of them. Both empty = nothing wrapped. SimpleAF overlay:
+#   _TOOLHEAD_PARK_PAUSE_CANCEL, _TOOLHEAD_PARK_END_PRINT with _CFS_CHUTE_ESCAPE.
 #box_sensor: cfs_box
 #   Publish box 1's temperature and humidity as [temperature_sensor <name>].
 #box_env: False
