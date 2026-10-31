@@ -290,6 +290,47 @@ extrude_temp: 220
 sudo systemctl restart klipper
 ```
 
+### K1 Max: automatic install
+
+`install.sh` does the steps of the two K1 Max sections below for you. It works on SimpleAF and on mainline Klipper or Kalico, and picks the right one by itself: SimpleAF is detected by `/usr/data/pellcorp.done`.
+
+SimpleAF (as root on the printer):
+
+```bash
+git clone -b k1-simpleaf https://github.com/Nico2433/creality-cfs-klipper.git /usr/data/creality-cfs-klipper
+sh /usr/data/creality-cfs-klipper/install.sh
+```
+
+Mainline Klipper or Kalico (as the Klipper user):
+
+```bash
+git clone -b k1-simpleaf https://github.com/Nico2433/creality-cfs-klipper.git ~/creality-cfs-klipper
+sh ~/creality-cfs-klipper/install.sh
+```
+
+It does the following:
+
+- links `creality_cfs.py` and `abortable_waits.py` into `klippy/extras/`. On SimpleAF it also installs `S54cfs_module`, which recreates the links on every boot;
+- copies `cfs_k1max.cfg` (and on SimpleAF `cfs_k1max_simpleaf.cfg`) to `config/macros/`, with `lane_data_file` set to `config/cfs/cfs_lanes.json`;
+- adds `[include macros/...]` to `printer.cfg` after the last include and above `SAVE_CONFIG`. It replaces an old `[include cfs.cfg]` or root-level include;
+- adds `[update_manager creality_cfs]` to `moonraker.conf`, for the checkout's origin and branch, so Fluidd and Mainsail can update the module;
+- warns when `[stepper_y] position_max` is below 306;
+- restarts Moonraker and Klipper, then reports whether the box connected.
+
+Running it again only changes what is different. Every file it edits is first backed up to `printer_data/cfs-backups/<date>/`. Options:
+
+- `--dry-run`: show the changes without making them;
+- `--uninstall`: remove everything it added (the slot data in `config/cfs/` is kept);
+- `--keep-config`: keep `macros/*.cfg` files you have edited;
+- `--no-restart`;
+- `--mode simpleaf|mainline`, `--klipper-dir`, `--printer-data`: for non-standard paths.
+
+Still yours to do:
+
+- the slicer G-code ([configs/SLICER_GCODE_K1MAX.md](configs/SLICER_GCODE_K1MAX.md));
+- on mainline, calling the `CFS_PRINT_*` hooks from your print macros (step 4 below);
+- on SimpleAF, saving your config overrides before a SimpleAF update, because it regenerates `printer.cfg` and `moonraker.conf`.
+
 ### K1 Max install
 
 Tested on a K1 Max running plain Klipper with the stock CFS (firmware 2.3.5.34, board `CR4CU220812S11`) on the stock CH340 adapter. `configs/cfs_k1max.cfg` holds the whole setup: the `[creality_cfs]` block, both nozzle-board switches, the tool-change macros (T0-T3, `CFS_TOOL`, `CFS_UNLOAD`) and the print hooks. It replaces `cfs_macros.cfg`; do not include both, since both define T0-T3.

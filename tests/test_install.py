@@ -191,3 +191,13 @@ def test_checkout_inside_config_is_refused(tree):
                          capture_output=True, text=True)
     assert res.returncode != 0
     assert "inside the printer config" in res.stderr
+
+
+def test_each_run_gets_its_own_backup_folder(tree):
+    run(tree)
+    run(tree, "--uninstall")
+    run(tree)
+    folders = list((tree / "printer_data" / "cfs-backups").iterdir())
+    assert len(folders) == 3      # every run edits files, each keeps its own backups
+    first = min(folders, key=lambda p: p.name)
+    assert "[include cfs.cfg]" in (first / "printer.cfg").read_text()

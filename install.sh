@@ -55,6 +55,8 @@ EXTRAS=$KLIPPER/klippy/extras
 PRINTER_CFG=$CONFIG/printer.cfg
 MOONRAKER_CONF=$CONFIG/moonraker.conf
 BACKUP=$PD/cfs-backups/$(date +%Y%m%d_%H%M%S)
+# two runs in the same second must not share (and overwrite) one backup folder
+n=1; base=$BACKUP; while [ -e "$BACKUP" ]; do BACKUP=$base.$n; n=$((n + 1)); done
 MODULES="creality_cfs.py abortable_waits.py"
 if [ "$MODE" = simpleaf ]; then
   CFGS="cfs_k1max.cfg cfs_k1max_simpleaf.cfg"

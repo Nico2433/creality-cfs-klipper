@@ -55,7 +55,7 @@ Klipper extra module. With this module you can:
 |----------|--------|
 | Creality Hi (F018) | ✅ Validated (primary reference hardware) |
 | K1 Max | ✅ Validated (stock CFS firmware 2.3.5.34) with [configs/cfs_k1max.cfg](configs/cfs_k1max.cfg); see [INSTALL.md](INSTALL.md#k1-max-install) |
-| K1 Max + SimpleAF | ✅ Supported through the overlay [configs/cfs_k1max_simpleaf.cfg](configs/cfs_k1max_simpleaf.cfg) on branch `k1-simpleaf`; see [INSTALL.md](INSTALL.md#k1-max-with-simpleaf) |
+| K1 Max + SimpleAF | ✅ Supported through the overlay [configs/cfs_k1max_simpleaf.cfg](configs/cfs_k1max_simpleaf.cfg) on branch `k1-simpleaf`; one-command setup with `install.sh`, see [INSTALL.md](INSTALL.md#k1-max-automatic-install) |
 | K1 / K1C | ⚠️ Untested. Same RS485 protocol as the Hi and the K1 Max; the presets in [configs/printer.cfg.example](configs/printer.cfg.example) are Creality's box.cfg values |
 | K2 Plus / K2 Max | ❌ Not supported. These use CFS-C over CAN, which this module does not speak |
 | Any printer + USB-RS485 adapter | ✅ Confirmed working (CH341 dongle) |
