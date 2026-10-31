@@ -52,9 +52,10 @@ CFS_INIT
 Queries box state via CMD_GET_BOX_STATE (0x0A). The request is sent with an
 EMPTY data payload. The reply data is 4 bytes `[b0][b1][b2][b3]`:
 
-- `b0`/`b1`: an opaque firmware base that drifts per box/firmware (0x1a20,
-  0x1b26, 0x1c24, 0x1d21 all observed on identical hardware). It carries no
-  load information. Never gate on it.
+- `b0`/`b1`: no load information; never gate on it. On the K1 Max CFS `b0` is
+  the box temperature (°C) and `b1` the humidity (%RH), decoded when `box_env`
+  is on. On the Hi it was documented as an opaque firmware base that drifts per
+  box (0x1a20, 0x1b26, 0x1c24, 0x1d21 observed on identical hardware).
 - `b2`: substatus (0x00 = OK).
 - `b3`: the real load flag. 0x02 = loaded/print-locked, 0x00 = feed/change
   mode.
@@ -337,6 +338,93 @@ CFS_ADDR_TABLE
 
 ---
 
+### CFS_FEEDER
+
+Engages or releases the feeder motor with 0x0F. The K1 Max stock host engages
+it at print start and releases it at the end; `cfs_k1max.cfg` does the same
+from `CFS_PRINT_START` / `CFS_PRINT_END`, together with
+`release_feeder_after_load: False`.
+
+```
+CFS_FEEDER ENABLE=1
+CFS_FEEDER ENABLE=0 BOX=1
+```
+
+Parameters:
+- `ENABLE`: 1 = engage, 0 = release (required)
+- `BOX`: controller address (1-4, default 1)
+
+---
+
+### CFS_DETECT
+
+Reads the path sensor (0x08 channel 0x01) and adopts the slot whose filament
+is in the path as the loaded tool, so a restart does not forget it. If the path
+and the toolhead switch are both empty, the loaded tool is cleared. If the box
+does not answer, the loaded tool is left unchanged.
+
+```
+CFS_DETECT
+```
+
+Parameters:
+- `BOX`: controller address (1-4, default 1)
+
+`detect_path_on_connect: True` runs the same read at connect.
+
+---
+
+### CFS_BUFFER
+
+Reads the filament buffer position with 0x05 and prints it: middle, full or
+empty.
+
+```
+CFS_BUFFER
+```
+
+Parameters:
+- `BOX`: controller address (1-4, default 1)
+
+---
+
+### CFS_TRY
+
+Runs one command and reports its error on the console instead of raising it,
+so the macro that called it goes on. A Klipper macro stops at the first error:
+without this, a jammed unload in `CANCEL_PRINT` aborts the cancel before
+`CANCEL_PRINT_BASE` and the file keeps printing.
+
+```
+CFS_TRY CMD=CFS_UNLOAD
+```
+
+Parameters:
+- `CMD`: one command name, no arguments (required). To pass arguments, put
+  the call in a `[gcode_macro]` and name that macro (as `cfs_k1max.cfg` does
+  with `_CFS_FEEDER_OFF`).
+
+---
+
+### AFC bridge commands (`afc_compat: True`)
+
+With `afc_compat: True` the module registers the AFC objects Fluidd's panel
+reads and the G-code it sends: `SET_COLOR`, `SET_MATERIAL`, `SET_WEIGHT`,
+`SET_SPOOL_ID`, `AFC_SET_SPOOL_TEMP`, `SET_MAP`, `SET_RUNOUT`, `CHANGE_TOOL`,
+`TOOL_UNLOAD`, `LANE_UNLOAD`, `AFC_CLEAR_MESSAGE`. Loads and unloads run the
+printer's `CFS_TOOL` / `CFS_UNLOAD` macros. It also adds:
+
+| Command | Description |
+|---------|-------------|
+| `CFS_LANES` | Print the slot data (material, colour, map, runout slot) |
+| `CFS_AUTO_MAP [FILE=] [DRY=1]` | Map the slicer tools of the print to the slots by material and colour |
+| `CFS_AUTO_REFILL FROM=<0-3>` | After a runout pause, continue with the refill slot of `FROM` (its runout slot, or same material and colour) and resume |
+| `CFS_TOWER_AREA [FILE=] [DRY=1]` | Declare the first layer's prime tower as an object so the adaptive bed mesh covers it |
+
+Slot data persists in `lane_data_file`.
+
+---
+
 ## Timeout model
 
 The box paces the choreography by HOLDING replies: a 0x10/0x11 frame is not
@@ -379,6 +467,10 @@ which is why an unload could never be confirmed on real hardware.
 | `CFS_SET_MODE` | 0x04 | Wire-confirmed (both forms) |
 | `CFS_SET_PRELOAD` | 0x0D | Wire-confirmed; gcode phase mapping inversion fixed in v1.4.0 |
 | `CFS_ADDR_TABLE` | n/a | Local table |
+| `CFS_FEEDER` | 0x0F | Wire-confirmed on a K1 Max |
+| `CFS_DETECT` | 0x08 ch 0x01 | Wire-confirmed on a K1 Max; the Hi meaning of this channel is not confirmed |
+| `CFS_BUFFER` | 0x05 | Wire-confirmed |
+| `CFS_TRY` | n/a | Local wrapper |
 | internal: slot presence | 0x02 READ_MATERIAL, 0x03 READ_REMAIN | Wire-confirmed; used by the connect init and the slot cache (no dedicated g-code) |
 | internal: buffer state | 0x0C GET_BUFFER_STATE (buffer node 0x81+) | Wire-confirmed; 8-byte block, all-zero = empty |
 | internal: RFID/material label | shares 0x02 | Tag-label byte decode pending a tagged-spool capture |
@@ -391,10 +483,10 @@ Commands identified from `strings` analysis of `box_wrapper.cpython-39.so`
 and `filament_rack_wrapper.cpython-39.so` on the Creality Hi. Function codes
 marked wire-confirmed were CRC-verified on the Hi RS-485 wire.
 
-**K1/K1C/K2 caveat:** the K1-family firmware is a CAN build that REMAPS
-0x02/0x05/0x08/0x0C. The codes below are the Hi RS-485 numbering; do not
-cross-use the CAN binary's numbering on this wire. K1-family compatibility is
-UNTESTED.
+**Printer families:** the K1 family uses this RS-485 numbering too; 0x02, 0x03,
+0x04, 0x05, 0x08, 0x0A, 0x0B, 0x0D, 0x0F, 0x10, 0x11 and 0x14 are confirmed on
+the wire on a K1 Max. The CAN binary's different numbering belongs to CFS-C
+(K2 / X2000E), which this module does not support; do not cross-use it here.
 
 ### Box Commands (box_wrapper.so)
 
@@ -566,8 +658,9 @@ BUFFER state (a corroboration signal, not a cut result; re-pinned
   seen at 0x81/0x82 on the reference printer are X/Y FOC-servo traffic
   sharing the bus, not CFS retrude. The separate buffer-empty runout switch
   is a GPIO line (see `configs/printer.cfg.example`).
-- K1/K1C/K2 compatibility is NOT confirmed: the K1-family firmware is a CAN
-  build that remaps 0x02/0x05/0x08/0x0C.
+- The K1 family speaks this RS-485 protocol; the K1 Max is hardware-tested
+  with `configs/cfs_k1max.cfg`, the K1 / K1C are untested. The K2 family uses
+  CFS-C over CAN and is not supported.
 - Mainline Klipper temperature note: mainline keeps the min_extrude_temp
   raise the Creality fork deletes, so the module blocks on M109 before any
   hotend `G1 E` move and enforces its own 170 C floor before any box-motor

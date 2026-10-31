@@ -27,6 +27,7 @@ def test_cold_boot_loader_box_is_woken_and_readdressed():
     hw = MockCFSHardware(box_count=1)
     hw.set_loader(0)
     cfs, _ = make_wired_controller(hw, box_count=1)
+    cfs.loader_wake = True
 
     assert cfs._run_auto_addressing() == 1
 
@@ -47,6 +48,7 @@ def test_cold_boot_loader_box_is_woken_and_readdressed():
 def test_app_box_needs_no_extra_wake():
     hw = MockCFSHardware(box_count=1)
     cfs, _ = make_wired_controller(hw, box_count=1)
+    cfs.loader_wake = True
 
     cfs._run_auto_addressing()
 
@@ -58,6 +60,7 @@ def test_stuck_loader_gives_up_after_bounded_passes():
     hw.set_loader(0)
     hw._resp_loader_to_app = lambda addr, data: None   # box never leaves its loader
     cfs, _ = make_wired_controller(hw, box_count=1)
+    cfs.loader_wake = True
 
     cfs._run_auto_addressing()
 
@@ -68,6 +71,7 @@ def test_stuck_loader_gives_up_after_bounded_passes():
 def test_online_box_answering_discovery_is_readdressed():
     hw = MockCFSHardware(box_count=1)
     cfs, _ = make_wired_controller(hw, box_count=1)
+    cfs.loader_wake = True
     cfs._run_auto_addressing()
     hw.restart_box(0)
 
@@ -79,6 +83,7 @@ def test_online_box_answering_discovery_is_readdressed():
 def test_heartbeat_reconnects_after_silent_ticks():
     hw = MockCFSHardware(box_count=1)
     cfs, _ = make_wired_controller(hw, box_count=1)
+    cfs.loader_wake = True
     cfs._run_auto_addressing()
     cfs._connected.add(0x01)
     cfs.heartbeat_interval = 4.
@@ -101,6 +106,7 @@ def test_heartbeat_reconnects_after_silent_ticks():
 def test_heartbeat_answer_resets_miss_count():
     hw = MockCFSHardware(box_count=1)
     cfs, _ = make_wired_controller(hw, box_count=1)
+    cfs.loader_wake = True
     cfs._run_auto_addressing()
     cfs._bus_lock = mock.MagicMock()
     cfs._bus_lock.test.return_value = False

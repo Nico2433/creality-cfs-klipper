@@ -156,10 +156,10 @@ toward the hotend.
 
 ### K1/K1C/K2 compatibility
 
-Not confirmed. The K1-family firmware is a CAN build that remaps at least
-0x02, 0x05, 0x08, and 0x0C to different numbers. Nothing in this repository has
-been tested against K1-family hardware; treat any cross-family use as untested
-and do not assume the RS485 codes documented here apply.
+K1 family: RS485, the same protocol as the Hi. Opcodes 0x02, 0x03, 0x04, 0x05,
+0x08, 0x0A, 0x0B, 0x0D, 0x0F, 0x10, 0x11 and 0x14 were confirmed on the wire on a
+K1 Max (CFS firmware 2.3.5.34). The K1 and K1C are untested. The remapped-opcode
+CAN build belongs to CFS-C (K2 / X2000E), which this repository does not support.
 
 ## Superseded early hypotheses
 

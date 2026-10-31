@@ -54,8 +54,9 @@ Klipper extra module. With this module you can:
 | Hardware | Status |
 |----------|--------|
 | Creality Hi (F018) | ✅ Validated (primary reference hardware) |
-| K1 / K1C | ⚠️ Untested. The K1-family firmware is a CAN build that remaps function codes (0x02/0x05/0x08/0x0C); do not assume the RS485 map applies |
-| K2 Plus / K2 Max | ⚠️ Untested (same CAN remap caveat as K1) |
+| K1 Max | ✅ Validated (stock CFS firmware 2.3.5.34) with [configs/cfs_k1max.cfg](configs/cfs_k1max.cfg); see [INSTALL.md](INSTALL.md#k1-max-install) |
+| K1 / K1C | ⚠️ Untested. Same RS485 protocol as the Hi and the K1 Max; the presets in [configs/printer.cfg.example](configs/printer.cfg.example) are Creality's box.cfg values |
+| K2 Plus / K2 Max | ❌ Not supported. These use CFS-C over CAN, which this module does not speak |
 | Any printer + USB-RS485 adapter | ✅ Confirmed working (CH341 dongle) |
 | BTT Octopus + Jetson Orin Nano | 🔵 In progress |
 
@@ -95,9 +96,13 @@ baud: 230400
 box_count: 1
 ```
 
-The cutter (`cut_switch_pin`, cut geometry) and flush tuning (`nozzle_volume`,
-`flush_cycle_cap`, `nozzle_clean_macro`, ...) options are documented in
+The cutter (`cut_switch_pin`, cut geometry), flush tuning (`nozzle_volume`,
+`flush_cycle_cap`, `nozzle_clean_macro`, ...) and K1-family options
+(`k1max_connect`, `heartbeat_interval`, ...) are documented in
 [configs/printer.cfg.example](configs/printer.cfg.example).
+
+On a K1 Max, include [configs/cfs_k1max.cfg](configs/cfs_k1max.cfg) instead of
+writing the block by hand; see [INSTALL.md](INSTALL.md#k1-max-install).
 
 ### 3. Wire the USB-RS485 adapter
 
@@ -157,7 +162,16 @@ CFS_VERSION BOX=1
 | `CFS_CUT [BOX=N] [TEMP=C]` | Mechanical cut ram (requires `cut_switch_pin` and the cut geometry); 0x05 post-check |
 | `CFS_FLUSH [BOX=N] [LEN=\|VOLUME=] [VELOCITY=] [TEMP=]` | Hotend purge loop: per-cycle cap, measuring-wheel clog watchdog, optional wipe macro, final retract |
 | `CFS_ADDR_TABLE` | Print the address assignment table |
-| `T0` / `T1` / `T2` / `T3` | Tool-change macros (cfs_macros.cfg): optional cut, unload the old slot, load the new one, optional flush |
+| `CFS_FEEDER ENABLE=0\|1 [BOX=N]` | Engage or release the feeder motor (0x0F); the K1 Max engages it once per print |
+| `CFS_DETECT [BOX=N]` | Read the path sensor (0x08 ch 0x01) and adopt the slot found there as the loaded tool |
+| `CFS_BUFFER [BOX=N]` | Read the filament buffer position (0x05): middle / full / empty |
+| `CFS_TRY CMD=<command>` | Run one command (no arguments) and report its error instead of raising it, so the calling macro goes on |
+| `T0` / `T1` / `T2` / `T3` | Tool-change macros (cfs_macros.cfg on the Hi, cfs_k1max.cfg on the K1 Max): optional cut, unload the old slot, load the new one, optional flush |
+
+With `afc_compat: True` the module also registers the AFC G-code surface Fluidd's
+panel sends (`SET_COLOR`, `SET_MATERIAL`, `SET_MAP`, `SET_RUNOUT`, `CHANGE_TOOL`, ...)
+plus `CFS_LANES`, `CFS_AUTO_MAP`, `CFS_AUTO_REFILL` and `CFS_TOWER_AREA`; see
+[docs/commands.md](docs/commands.md).
 
 **Topology:** one CFS is ONE controller on the RS485 bus (normally address 0x01, `BOX=1`)
 with four slots selected by a data-byte bitmask (`TOOL=0..3` maps to 0x01/0x02/0x04/0x08).

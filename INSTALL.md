@@ -58,9 +58,11 @@ flowchart LR
 
 The module needs no pyserial and no pip packages: since v1.3.0 it opens the port itself (`os.open` with `O_NONBLOCK` plus raw 8N1 termios) and registers the fd with Klipper's reactor, so serial waits never block the Klipper event loop. RS485 direction switching is left to an auto-direction adapter by default; kernel RTS-as-DE mode is available via `rts_on_send`.
 
-**Validated on:** Creality Hi (F018) with a CFS v1 box. Transport, CRC, and addressing are capture-validated in this module; the load/unload/cut/flush choreography was hardware-validated on the reference implementation (same wire protocol, same printer), and this module's port of it is wire-faithful but has not yet been exercised on hardware itself.
+**Validated on:** Creality Hi (F018) with a CFS v1 box, and a K1 Max with the stock CFS (firmware 2.3.5.34, see [K1 Max install](#k1-max-install)). Transport, CRC, and addressing are capture-validated in this module; the load/unload/cut/flush choreography was hardware-validated on the reference implementation (same wire protocol, same printer), and this module's port of it is wire-faithful but has not yet been exercised on hardware itself.
 
-**K1 / K1C / K2 family: UNTESTED.** The K1-family firmware is a CAN build that remaps several function codes (0x02/0x05/0x08/0x0C), so do not assume the RS485 protocol documented here carries over. Reports from K-series hardware are welcome.
+**K1 family: RS485, same protocol as the Hi.** The operational opcodes are confirmed on the wire on a K1 Max. The K1 / K1C presets in `configs/printer.cfg.example` come from Creality's box.cfg and are untested; reports are welcome.
+
+**K2 family: not supported.** The K2 Plus / K2 Max use CFS-C over CAN, which this module does not speak.
 
 ---
 
@@ -69,7 +71,7 @@ The module needs no pyserial and no pip packages: since v1.3.0 it opens the port
 | Item | Notes |
 |---|---|
 | Klipper-compatible host | Pi 4/5, Jetson, BTT CB1/CB2, or the printer's own SBC |
-| CFS box (at least one) | Stock Creality CFS or CFS-C |
+| CFS box (at least one) | Stock Creality CFS (RS485). CFS-C (K2, CAN) is not supported. |
 | USB-RS485 adapter **OR** mainboard RS485 port | CH341 chipset confirmed working. FTDI-based dongles also work. |
 | 24 V PSU connection | The CFS draws ~24 V on pin 4 of its connector. Use your printer's PSU; the dongle carries data only. |
 | 3 jumper wires or a CFS pigtail | A+, B-, GND. ~20 AWG is plenty. |
@@ -179,6 +181,10 @@ cp src/creality_cfs.py ~/klipper/klippy/extras/
 cp configs/cfs_macros.cfg ~/printer_data/config/
 ```
 
+`cfs_macros.cfg` is the Hi macro set. On a K1 Max use `cfs_k1max.cfg` instead, not both: see [K1 Max install](#k1-max-install).
+
+On mainline Klipper, add a `[respond]` section to `printer.cfg` if it has none. `cfs_macros.cfg` does not contain one, and without it every `RESPOND` in the macros fails with `Unknown command:"RESPOND"`. Kalico loads `respond` on its own.
+
 ### 3. Edit `printer.cfg`
 
 Minimum block, substitute the serial port for your hardware:
@@ -249,6 +255,25 @@ extrude_temp: 220
                           # watchdog arms only for cycles >= 2x this length
 #flush_velocity: 360
 #nozzle_clean_macro: WIPE_NOZZLE   # optional [gcode_macro] run once per flush cycle
+
+# K1-family stock parity and idle behaviour; every default is the Hi behaviour.
+# Descriptions in configs/printer.cfg.example, K1 Max values in configs/cfs_k1max.cfg.
+#load_finalize: True
+#release_feeder_after_load: True
+#retrude_pull_len: 15
+#retrude_pull_velocity: 360
+#cut_switch_button: cfs_cut_switch
+#heartbeat_interval: 0        # idle 0x0A poll (s); 0 = off
+#idle_presence_poll: True
+#k1max_connect: False
+#loader_wake: False
+#detect_path_on_connect: False
+#buffer_recheck_s: 0
+#box_sensor: cfs_box
+#box_env: False               # True by default when box_sensor is set
+#afc_compat: False
+#lane_data_file: <printer.cfg directory>/cfs_lanes.json
+#afc_extruder: extruder
 ```
 
 > 💡 **Prefer `by-id` paths over `/dev/ttyUSB0`** when using USB adapters. `ttyUSB0` can shift when you plug in other USB devices. `ls /dev/serial/by-id/` to find your adapter's stable path.
@@ -260,6 +285,53 @@ extrude_temp: 220
 ```bash
 sudo systemctl restart klipper
 ```
+
+### K1 Max install
+
+Tested on a K1 Max running plain Klipper with the stock CFS (firmware 2.3.5.34, board `CR4CU220812S11`) on the stock CH340 adapter. `configs/cfs_k1max.cfg` holds the whole setup: the `[creality_cfs]` block, both nozzle-board switches, the tool-change macros (T0-T3, `CFS_TOOL`, `CFS_UNLOAD`) and the print hooks. It replaces `cfs_macros.cfg`; do not include both, since both define T0-T3.
+
+1. Copy the module and the config:
+
+   ```bash
+   cp src/creality_cfs.py ~/klipper/klippy/extras/
+   cp configs/cfs_k1max.cfg <your printer.cfg directory>/
+   ```
+
+   `cfs_k1max.cfg` contains `[respond]`, which mainline Klipper needs for the macros' `RESPOND` messages (the `CFS_MENU` dialog, the cut-switch messages). Without it every `RESPOND` fails with `Unknown command:"RESPOND"`. Kalico loads `respond` on its own.
+
+2. In `printer.cfg`, include it and make room for the cut:
+
+   ```ini
+   [include cfs_k1max.cfg]
+
+   [stepper_y]
+   position_max: 307.5   # must be >= 306: the cut presses at Y306 (stock 307.5)
+   ```
+
+3. Check the settings in `cfs_k1max.cfg` against your machine:
+   - `serial_port: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`. Confirm with `ls /dev/serial/by-id/`.
+   - The toolhead filament switch is `[filament_switch_sensor filament_sensor_2]` on `^!nozzle_mcu:PA10`. The cutter switch is `nozzle_mcu:PA8` (`cut_switch_pin` and `[gcode_button cfs_cut_switch]`). Remove any other section that uses PA8 or PA10, such as an older preset that put `filament_sensor_2` on PA8.
+   - `lane_data_file` points to `/usr/data/printer_data/config/cfs/cfs_lanes.json`. The directory must exist; change the path if your config lives elsewhere.
+   - Keep `afc_compat: True`: T0-T3, `CFS_PRINT_START` and `CFS_MENU` read the AFC objects it registers (`printer.AFC`, `AFC_lane slot1..4`).
+   - Leave `cut_pos_x` unset. The stock box.cfg value (38) equals `pre_cut_pos_x`, and `CFS_CUT` refuses a zero-travel X ram; without it the cut rams along Y to `cut_pos_y: 306`.
+
+4. Call the hooks from your own print macros:
+
+   | Macro | Add | Where |
+   |---|---|---|
+   | `START_PRINT` | `CFS_PRINT_START INITIAL_TOOL={params.INITIAL_TOOL} TEMP={params.EXTRUDER_TEMP}` | after homing, heating and the bed mesh, before the purge line; the slicer start G-code passes `INITIAL_TOOL=[initial_tool]` |
+   | `END_PRINT` | `CFS_PRINT_END` | before the heaters turn off |
+   | `CANCEL_PRINT` | `CFS_PRINT_CANCEL` | before `CANCEL_PRINT_BASE` |
+   | `RESUME` | `CFS_RESUME_CHECK` | before `RESUME_BASE` |
+   | `PAUSE` / `CANCEL_PRINT` park macros | `_CFS_CHUTE_ESCAPE` | first line |
+
+   `CFS_PRINT_END` runs its unload through `CFS_TRY`, so a jammed unload is reported and `CANCEL_PRINT` still completes. The slicer change-filament G-code is described at the end of `cfs_k1max.cfg`.
+
+5. Fans: the stock K1 fans are `output_pin` fan0/1/2 behind an `M106` macro, with no `[fan]` section; the stock chamber fan is `exhaust_fan`. The chute macros drive the part fan through `M106`, so they work with that. `variable_aux_fan` in `_CFS_SETTINGS` only accepts a `[fan_generic]` name, so leave it `""` on stock fans.
+
+6. Restart Klipper. With `heartbeat_interval: 4` the box front LEDs stop blinking red, and `box_sensor: cfs_box` publishes the box temperature and humidity as `temperature_sensor cfs_box`.
+
+The tool change runs: z-hop, cut, lift to Z30, unload to the box, move to the rear purge chute (185, 305.5) by way of Y291.5, load the new slot, purge, back to the print. The stock nozzle wipe is skipped (see the header of `cfs_k1max.cfg`).
 
 ---
 
@@ -426,7 +498,7 @@ The `GET_BOX_STATE` (0x0A) reply is 4 data bytes `[b0][b1][b2][b3]`:
 
 | Byte | Meaning | Values |
 |---|---|---|
-| `b0` `b1` | Opaque firmware base. Drifts per box/firmware (`1a20`, `1b26`, `1c24`, `1d21` all observed on identical hardware). Carries **no** state; never gate on it. | varies |
+| `b0` `b1` | Carries **no** load state; never gate on it. On the K1 Max CFS, `b0` is the box temperature (°C) and `b1` the humidity (%RH), decoded when `box_env` is on. On the Hi it was documented as an opaque firmware base (`1a20`, `1b26`, `1c24`, `1d21` observed on identical hardware). | varies |
 | `b2` | Substatus | `0x00` = OK |
 | `b3` | The real load flag | `0x02` = loaded / print-locked, `0x00` = feed/change mode, `0x04` = busy (during a `0x16` event) |
 

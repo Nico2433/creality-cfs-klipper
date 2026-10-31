@@ -12,11 +12,33 @@ position in 0.01mm]`; the 0x11 unload is a held START/FINISH pair gated on the
 toolhead filament switch, not a one-shot ACK; and the "protocol identical
 across K1/K2/Hi" claim is downgraded to untested (the K1-family firmware is a
 CAN build with remapped function codes). See the 1.4.0 entry below and
-`docs/protocol.md` for the corrected wire truth.
+`docs/protocol.md` for the corrected wire truth. The CAN claim was later corrected
+for the K1 family: it applies to CFS-C (K2), and the K1 family speaks the Hi's
+RS485 protocol (see [Unreleased]).
 
 ---
 
 ## [Unreleased]
+
+### Added
+
+- **K1 Max support.** Hardware-tested on a K1 Max running plain Klipper with the stock CFS (firmware 2.3.5.34, board CR4CU220812S11) on the stock CH340 adapter (`/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`, 230400 baud). The K1 family speaks the Hi's RS485 protocol, not CAN: 0x02, 0x03, 0x04, 0x05, 0x08, 0x0A, 0x0B, 0x0D, 0x0F, 0x10, 0x11 and 0x14 are confirmed on the K1 Max wire. K1 / K1C remain untested.
+- **`configs/cfs_k1max.cfg`**: the K1 Max setup for plain Klipper, used instead of `cfs_macros.cfg` (both define T0-T3). It holds the `[creality_cfs]` block, the toolhead switch on `^!nozzle_mcu:PA10`, the cutter switch on `nozzle_mcu:PA8`, the Y-ram cut (X38 Y230 to Y306), the rear purge chute (185, 305.5, Z30) and the print hooks `CFS_PRINT_START`, `CFS_PRINT_END`, `CFS_PRINT_CANCEL`, `CFS_RESUME_CHECK` and `_CFS_CHUTE_ESCAPE`.
+- **`[creality_cfs]` options**, all defaulting to the Hi behaviour: `k1max_connect`, `idle_presence_poll`, `heartbeat_interval`, `loader_wake`, `detect_path_on_connect`, `buffer_recheck_s`, `load_finalize`, `release_feeder_after_load`, `retrude_pull_len`, `retrude_pull_velocity`, `cut_switch_button`, `box_env`, `box_sensor`, `afc_compat`, `lane_data_file`, `afc_extruder`. Described in `configs/printer.cfg.example`.
+- **`CFS_TRY CMD=<command>`**: runs one command and reports its error without aborting the calling macro, so a failed unload in `CANCEL_PRINT` cannot stop the cancel.
+- **`CFS_FEEDER ENABLE=0|1`**, **`CFS_DETECT`** and **`CFS_BUFFER`**; with `afc_compat`, the AFC G-code surface for Fluidd plus `CFS_LANES`, `CFS_AUTO_MAP`, `CFS_AUTO_REFILL` and `CFS_TOWER_AREA`. See `docs/commands.md`.
+- **`[respond]` in `cfs_k1max.cfg`**: mainline Klipper needs it for the macros' `RESPOND` messages (Kalico loads it on its own). `cfs_macros.cfg` has none; `INSTALL.md` says to add it. Both files load and every macro renders on mainline Klipper 0cee841e (Python 3.8) and Kalico 488b45d5 (Python 3.9).
+- **Box temperature and humidity**: on the K1 Max the 0x0A reply carries °C in b0 and %RH in b1; `box_sensor` publishes them as a `temperature_sensor`.
+
+### Fixed
+
+- **The heartbeat no longer interleaves with a running `CFS_EXTRUDE` / `CFS_RETRUDE` / `CFS_CUT` / `CFS_FLUSH`.** The bus lock covers one frame; the heartbeat now also skips while a multi-frame choreography runs.
+- **A box that goes silent during a print is not re-addressed until the print ends.** Re-addressing sends 0x04 feed mode to every box, so it is deferred while a print is running or paused.
+- **`CFS_DETECT` keeps the active tool when the box does not answer.** A missed 0x08 reply read as a clear path, so with the toolhead switch empty the loaded slot was cleared.
+
+### Changed (docs)
+
+- `README.md`, `INSTALL.md`, `configs/printer.cfg.example` and `docs/`: removed the claim that the K1 family is a CAN build; the K1 Max is listed as validated and the K2 family as not supported. `configs/printer.cfg.example` put the K1 toolhead switch on PA8; it is on PA10, and PA8 is the cutter switch.
 
 ---
 

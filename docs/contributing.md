@@ -94,7 +94,7 @@ This document provides detailed guidance for developers who want to contribute t
 ## Areas Where Help Is Needed
 
 *   Hardware runs of the v1.4.0 load/unload choreography (ported from the hardware-validated reference implementation, not yet exercised on hardware in this module)
-*   Physical hardware testing on the Creality Hi; K1/K1C/K2 reports are especially valuable (untested there, the K1-family firmware is a CAN build with remapped function codes)
+*   Physical hardware testing on the Creality Hi; K1 / K1C reports are especially valuable (same RS485 protocol, hardware-tested only on the K1 Max so far)
 *   Decoding the remaining opaque fields (e.g., GET\_BOX\_STATE bytes b0-b2, the 0x56 frames)
 *   Improving documentation and examples
 *   Expanding test coverage

@@ -671,7 +671,7 @@ LOADER_WAKE_DELAY_S: float = 1.0
 # (box power-cycled or replugged while Klipper kept running).
 HEARTBEAT_LOST_REINIT: int = 3
 # The buffer can read full right after a load; stock checks it again ~7 s later.
-BUFFER_SETTLE_S: float = 7.0
+BUFFER_SETTLE_S: float = 7.0       # K1 Max: a non-middle buffer right after a load settles
 # Plausible box temperatures in the 0x0A idle reply; anything else is not an env reading.
 BOX_ENV_TEMP_RANGE: tuple = (0, 80)
 
@@ -1059,12 +1059,6 @@ class CrealityCFS:
         # CFS_CUT checks the switch reads PRESSED at the cut position (stock confirms every
         # cut this way) and raises a recoverable error after backing off if it does not.
         self.cut_switch_button = config.get("cut_switch_button", None)
-        # park_guard / park_guard_gcode: run park_guard_gcode before each listed command (the
-        # client's park macros). A load or purge that fails at the chute leaves the toolhead
-        # there, and CANCEL_PRINT/PAUSE park diagonally from it; the guard macro can move it out
-        # of the chute first. Empty disables.
-        self.park_guard = [c.strip() for c in config.get("park_guard", "").split(",") if c.strip()]
-        self.park_guard_gcode = config.get("park_guard_gcode", "")
         # heartbeat_interval: seconds between idle GET_BOX_STATE (0x0A) polls of every online
         # box; 0 disables. The K1 Max stock host polls every ~4 s, and without it the box's
         # front LEDs blink red as if no host were attached. Skipped while a command holds
@@ -1085,10 +1079,23 @@ class CrealityCFS:
         # 0x0D [0f 01], 0x08 [00]. The default (Hi) burst adds 0x0D [00 01] and the all-slot
         # 0x02/0x03 scan, after which the K1 Max box stopped running its own spool insert.
         self.k1max_connect: bool = config.getboolean("k1max_connect", False)
+        # buffer_recheck_s: after a load whose 0x05 buffer read is not middle, read it again
+        # this many seconds later and only log it (K1 Max: the purge is still feeding, 7 s).
+        # 0 = upstream behaviour: report the reading on the console at once.
+        self.buffer_recheck_s: float = config.getfloat("buffer_recheck_s", 0., minval=0.)
+        # box_env: read the box temperature/humidity from the idle 0x0A reply (b0 = deg C,
+        # b1 = % RH, confirmed on the K1 Max CFS). On the Hi those bytes were documented as an
+        # opaque firmware base, so it is off unless set or a box_sensor is configured.
+        self.box_env: bool = config.getboolean(
+            "box_env", config.get("box_sensor", None) is not None)
+        # loader_wake: when a box answers discovery from its bootloader (mode 1, K1 Max after
+        # a power-on) send 0x0B LOADER_TO_APP and address it again. Off = upstream addressing.
+        self.loader_wake: bool = config.getboolean("loader_wake", False)
         # afc_compat: publish the CFS to Fluidd's AFC panel and keep per-slot filament data
         # (material/colour/tool map/runout slot) with the AFC G-code surface. See CFSAfcBridge.
         self._presence_every = 1            # heartbeat ticks between slot-presence refreshes
         self._inserting: dict = {}          # addr -> time of the last 0x30 insert push
+        self._op_depth = 0                  # >0 while a load/unload/cut/flush runs
         self._heartbeat_count = 0
         self._heartbeat_misses = 0
         # (temperature, humidity) per box address from the idle 0x0A replies.
@@ -1135,7 +1142,6 @@ class CrealityCFS:
 
         # --- Register Klipper lifecycle handlers ---
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
-        self.printer.register_event_handler("klippy:connect", self._install_park_guard)
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
         self.printer.register_event_handler("klippy:disconnect", self._handle_shutdown)
 
@@ -1172,12 +1178,12 @@ class CrealityCFS:
         )
         self.gcode.register_command(
             "CFS_EXTRUDE",
-            self.cmd_CFS_EXTRUDE,
+            self._exclusive(self.cmd_CFS_EXTRUDE),
             desc=self.cmd_CFS_EXTRUDE_help,
         )
         self.gcode.register_command(
             "CFS_RETRUDE",
-            self.cmd_CFS_RETRUDE,
+            self._exclusive(self.cmd_CFS_RETRUDE),
             desc=self.cmd_CFS_RETRUDE_help,
         )
         self.gcode.register_command(
@@ -1187,12 +1193,12 @@ class CrealityCFS:
         )
         self.gcode.register_command(
             "CFS_CUT",
-            self.cmd_CFS_CUT,
+            self._exclusive(self.cmd_CFS_CUT),
             desc=self.cmd_CFS_CUT_help,
         )
         self.gcode.register_command(
             "CFS_FLUSH",
-            self.cmd_CFS_FLUSH,
+            self._exclusive(self.cmd_CFS_FLUSH),
             desc=self.cmd_CFS_FLUSH_help,
         )
         self.gcode.register_command(
@@ -1259,21 +1265,25 @@ class CrealityCFS:
     # Klipper lifecycle handlers
     # -----------------------------------------------------------------------
 
-    def _install_park_guard(self) -> None:
-        """Wrap each park_guard command so park_guard_gcode runs right before it."""
-        if not self.park_guard_gcode:
-            return
-        for name in self.park_guard:
-            original = self.gcode.register_command(name, None)
-            if original is None:
-                logger.warning("creality_cfs: park_guard: command %s not found", name)
-                continue
-            desc = getattr(self.gcode, "gcode_help", {}).get(name)
+    def _exclusive(self, handler):
+        """Mark a multi-frame box choreography as running, so the idle heartbeat does not
+        slip frames between its stages (the bus lock only covers one frame at a time)."""
+        def run(gcmd):
+            self._op_depth += 1
+            try:
+                handler(gcmd)
+            finally:
+                self._op_depth -= 1
+        return run
 
-            def guarded(gcmd, original=original):
-                self.gcode.run_script_from_command(self.park_guard_gcode)
-                original(gcmd)
-            self.gcode.register_command(name, guarded, desc=desc)
+    def _printing(self, eventtime: float) -> bool:
+        stats = self.printer.lookup_object("print_stats", None)
+        if stats is None:
+            return False
+        try:
+            return stats.get_status(eventtime).get("state") in ("printing", "paused")
+        except Exception:
+            return False
 
     def _handle_ready(self) -> None:
         """Called when Klipper transitions to ready state.
@@ -1299,7 +1309,7 @@ class CrealityCFS:
         Never contends with a running command: if the bus is held, wait for the next tick."""
         if self._shutdown:
             return self.reactor.NEVER
-        if self.is_connected and not self._bus_lock.test():
+        if self.is_connected and not self._op_depth and not self._bus_lock.test():
             self._heartbeat_count += 1
             refresh = (self.idle_presence_poll
                        and self._heartbeat_count % self._presence_every == 0)
@@ -1320,7 +1330,12 @@ class CrealityCFS:
             self._heartbeat_misses = self._heartbeat_misses + 1 if silent else 0
             if self._heartbeat_misses >= HEARTBEAT_LOST_REINIT:
                 self._heartbeat_misses = 0
-                self._reconnect_boxes()
+                if self._printing(eventtime):
+                    # Re-addressing sends 0x04 feed mode to every box: never mid-print.
+                    logger.warning("creality_cfs: box silent during a print; re-addressing "
+                                   "deferred until the print ends")
+                else:
+                    self._reconnect_boxes()
         return eventtime + self.heartbeat_interval
 
     def _reconnect_boxes(self) -> None:
@@ -1946,8 +1961,8 @@ class CrealityCFS:
 
             # Step 6 (stock loader_check): a box still in its loader never answers
             # operational commands. Start its app, then address it again next pass.
-            if not any(e.mapped and e.mode == BoxAddressEntry.MODE_LOADER
-                       for e in self._box_table):
+            if not self.loader_wake or not any(
+                    e.mapped and e.mode == BoxAddressEntry.MODE_LOADER for e in self._box_table):
                 break
             if wake_pass == LOADER_WAKE_PASSES - 1:
                 logger.warning("creality_cfs: box still in loader mode after %d wake attempts",
@@ -2020,7 +2035,8 @@ class CrealityCFS:
                 logger.warning("creality_cfs: no free address slots for discovered box")
                 continue
 
-            self._box_table[addr - 1].mode = mode
+            if self.loader_wake:
+                self._box_table[addr - 1].mode = mode
             logger.info(
                 "creality_cfs: discovered box, addr=0x%02X mode=%d uniid=%s",
                 addr, mode, " ".join(f"0x{b:02X}" for b in uniid),
@@ -2043,10 +2059,15 @@ class CrealityCFS:
         Returns:
             int: Assigned address (0x01-0x04), or -1 if no slot available.
         """
-        # Priority 1: previously mapped, matching UniID. A box we think is online that
-        # answers the broadcast has restarted (or left its loader) and lost its address.
+        # Priority 1: previously mapped, matching UniID. With loader_wake, a box we think is
+        # online that answers the broadcast has restarted (or left its loader) and lost its
+        # address; without it, only an offline/init entry matches (upstream).
+        reusable = ((BoxAddressEntry.ONLINE_OFFLINE, BoxAddressEntry.ONLINE_INIT,
+                     BoxAddressEntry.ONLINE_WAIT_ACK, BoxAddressEntry.ONLINE_ONLINE)
+                    if self.loader_wake
+                    else (BoxAddressEntry.ONLINE_OFFLINE, BoxAddressEntry.ONLINE_INIT))
         for entry in self._box_table:
-            if entry.mapped and entry.uniid == uniid:
+            if entry.mapped and entry.online in reusable and entry.uniid == uniid:
                 if entry.online == BoxAddressEntry.ONLINE_ONLINE:
                     logger.info("creality_cfs: box 0x%02X answered discovery, it restarted; "
                                 "re-addressing", entry.addr)
@@ -2113,7 +2134,8 @@ class CrealityCFS:
                     entry.acked = True
                     entry.online = BoxAddressEntry.ONLINE_ONLINE
                     entry.lost_cnt = 0
-                    entry.mode = data_bytes[1]
+                    if self.loader_wake:
+                        entry.mode = data_bytes[1]
                     logger.info("creality_cfs: addr=0x%02X acknowledged SET_SLAVE_ADDR", target_addr)
                     break
         return True
@@ -2154,7 +2176,7 @@ class CrealityCFS:
                 entry.acked = True
                 entry.online = BoxAddressEntry.ONLINE_ONLINE
                 entry.lost_cnt = 0
-                if len(data_bytes) >= 2:
+                if self.loader_wake and len(data_bytes) >= 2:
                     entry.mode = data_bytes[1]
                 break
         return True
@@ -2268,8 +2290,8 @@ class CrealityCFS:
         # Fault dispatch (buffer spec 2026-07-19): the box raises its OWN feed-loop faults
         # as abnormal STATUS bytes on the 0x0A reply; route them to the status sink.
         self._note_box_status(addr, status, data_bytes)
-        if status == 0x00 and BOX_ENV_TEMP_RANGE[0] <= d[0] <= BOX_ENV_TEMP_RANGE[1] \
-                and d[1] <= 100:
+        if self.box_env and status == 0x00 \
+                and BOX_ENV_TEMP_RANGE[0] <= d[0] <= BOX_ENV_TEMP_RANGE[1] and d[1] <= 100:
             self._box_env[addr] = (float(d[0]), float(d[1]))
         logger.debug("creality_cfs: GET_BOX_STATE addr=0x%02X raw=%s loaded=%s event=0x%02X",
                      addr, data_bytes.hex(), result["loaded"],
@@ -2972,7 +2994,7 @@ class CrealityCFS:
         # feeding and the buffer legitimately reads full (seen on the K1 Max).
         if buf is not None and buf["code"] != BUFFER_STATE_MIDDLE:
             logger.info("creality_cfs: buffer still reads %s %.0f s after the load",
-                        buf["state"], BUFFER_SETTLE_S)
+                        buf["state"], self.buffer_recheck_s)
 
     def cut_state(self, addr: int) -> bool:
         """DEPRECATED bool form: True iff the 0x05 byte reads 0x00 (buffer middle).
@@ -3209,11 +3231,14 @@ class CrealityCFS:
         buf = self.get_buffer_state(addr)
         if buf is None:
             gcmd.respond_info("CFS_EXTRUDE: post-load buffer read (0x05): no response.")
-        elif buf["code"] != BUFFER_STATE_MIDDLE:
-            # Often transient right after the ramp: read again once it has settled.
+        elif buf["code"] != BUFFER_STATE_MIDDLE and self.buffer_recheck_s > 0.:
+            # Often transient right after the ramp (K1 Max): read again once it has settled.
             self.reactor.register_callback(
                 lambda et, a=addr: self._recheck_buffer_after_load(a),
-                self.reactor.monotonic() + BUFFER_SETTLE_S)
+                self.reactor.monotonic() + self.buffer_recheck_s)
+        elif buf["code"] != BUFFER_STATE_MIDDLE:
+            gcmd.respond_info("CFS_EXTRUDE: post-load buffer reads %s (stock expects "
+                              "middle) -- informational." % buf["state"])
         self.set_print_mode(addr, slot)                # 0x04 [slot][00]
         if self.release_feeder_after_load:
             self.ctrl_connection_motor_action(addr, False)  # 0x0F 00 release
@@ -4121,7 +4146,11 @@ class CrealityCFS:
         if not self.is_connected:
             raise gcmd.error("CFS serial port is not connected")
         addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
-        tool = self.detect_path_slot(addr)
+        flag = self.get_hardware_status(addr, HW_SENSOR_CONNECTIONS)
+        if flag < 0:
+            gcmd.respond_info("CFS_DETECT: box %d did not answer; active tool unchanged" % addr)
+            return
+        tool = SLOT_BITMASKS.index(flag) if flag in SLOT_BITMASKS else None
         if tool is None:
             if self._toolhead_filament_detected() is False and self._active_tool is not None:
                 # Path and toolhead both empty (e.g. the slot ran out): nothing is loaded.

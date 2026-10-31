@@ -104,9 +104,9 @@ The vectors confirm:
 - Standard SMBUS check value: `crc8_cfs(b"123456789") == 0xF4`
 
 They validate the CRC algorithm and frame geometry only. They say nothing
-about function-code identity across printer families; the K1-family firmware
-is a CAN build that remaps several function codes, so K1/K1C/K2 compatibility
-remains untested.
+about function-code identity across printer families. The operational codes
+are wire-confirmed on the Hi and on a K1 Max; the K1 / K1C are untested, and
+the K2 family (CFS-C over CAN) is not supported.
 
 ---
 

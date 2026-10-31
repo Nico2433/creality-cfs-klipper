@@ -78,7 +78,7 @@ Include:
 ## Areas Where Help Is Needed
 
 *   Hardware runs of the v1.4.0 load/unload choreography (ported from the hardware-validated reference implementation, not yet exercised on hardware in this module)
-*   Physical hardware testing on the Creality Hi; K1/K1C/K2 reports are especially valuable (untested there, the K1-family firmware is a CAN build with remapped function codes)
+*   Hardware reports from the K1 and K1C (same RS485 protocol, only the Hi and K1 Max are tested); the K2 family uses CFS-C over CAN and is not supported
 *   Decoding the remaining opaque fields (e.g., GET_BOX_STATE bytes b0-b2, the 0x56 frames)
 *   Improving documentation and examples
 *   Expanding test coverage
@@ -181,7 +181,7 @@ Include:
 ## Areas Where Help Is Needed
 
 *   Hardware runs of the v1.4.0 load/unload choreography (ported from the hardware-validated reference implementation, not yet exercised on hardware in this module)
-*   Physical hardware testing on the Creality Hi; K1/K1C/K2 reports are especially valuable (untested there, the K1-family firmware is a CAN build with remapped function codes)
+*   Hardware reports from the K1 and K1C (same RS485 protocol, only the Hi and K1 Max are tested); the K2 family uses CFS-C over CAN and is not supported
 *   Decoding the remaining opaque fields (e.g., GET_BOX_STATE bytes b0-b2, the 0x56 frames)
 *   Improving documentation and examples
 *   Expanding test coverage

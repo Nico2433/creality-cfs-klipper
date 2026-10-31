@@ -402,7 +402,7 @@ Reply data word `[b0][b1][b2][b3]`:
 
 | Byte | Meaning |
 |------|---------|
-| b0, b1 | OPAQUE firmware base. Drifts per box/firmware: `0x1a20`, `0x1b26`, `0x1c24` and `0x1d21` were all observed on identical hardware. Carries NO load information. Gating on it caused a proven dry-purge bug on the reference stack. Diagnostics only. |
+| b0, b1 | Carries NO load information. Gating on it caused a proven dry-purge bug on the reference stack. On the K1 Max CFS, b0 = box temperature (°C) and b1 = humidity (%RH); the module decodes them when `box_env` is on. On the Hi they were documented as an opaque firmware base (`0x1a20`, `0x1b26`, `0x1c24` and `0x1d21` observed on identical hardware). |
 | b2 | Substatus. `0x00` = OK. |
 | b3 | The real load flag. `0x02` = loaded/print-locked (1:1 with the SET_BOX_MODE `[slot][00]` print-mode command). `0x00` = feed/change mode. |
 
@@ -497,8 +497,10 @@ RSP: ACK
 ```
 
 Engage/release the connection (feeder) motor. These calls bracket a load: engage
-before the 0x10 feed, release after print mode is set. The Hi wire uses 0x0F for this;
-the K1-family CAN binary uses 0x07 for the same operation. Do not cross-use.
+before the 0x10 feed, release after print mode is set. The Hi and K1 Max wires use 0x0F
+for this; the CFS-C (K2) CAN binary uses 0x07 for the same operation. Do not cross-use.
+The stock K1 Max host does not release after each load: it engages once at print start
+and releases at the end (`release_feeder_after_load: False`, `CFS_FEEDER`).
 
 ---
 
@@ -763,7 +765,7 @@ From `strings` analysis of `box_wrapper.cpython-39.so`:
 
 - **Creality Hi (F018), RS485:** primary reference. Transport, addressing, and every
   function code above are capture-validated on this wire.
-- **K1 / K1C / K1 SE / K1 Max, RS485:** same transport and same addressing as the Hi.
+- **K1 / K1C / K1 SE / K1 Max, RS485:** same transport, addressing and protocol as the Hi.
   Creality's CFS firmware ships `config/K1_CR4CU220812S11/box.cfg` with `[serial_485]`,
   `[auto_addr]` and `[box] bus: serial485` over a CH340 at 230400, and the same
   `MultiColorMeterialBoxWrapper` class, `communication_*` methods, ~72 `BOX_*` g-codes
@@ -771,12 +773,16 @@ From `strings` analysis of `box_wrapper.cpython-39.so`:
   firmware ships `auto_addr_wrapper.py` in cleartext and every constant in the
   Addressing section below matches it exactly.
 
-  What is **not** confirmed on a K1 is the operational opcode numbers. Those are
-  compiled constants that do not appear in strings, so they are inferred from an
-  identical command surface rather than read off the wire. Capture before driving
-  hardware. Differences from the Hi are wiring, not protocol: the serial node is
+  The operational opcodes 0x02, 0x03, 0x04, 0x05, 0x08, 0x0A, 0x0B, 0x0D, 0x0F,
+  0x10, 0x11 and 0x14 are confirmed on the wire on a K1 Max (stock CFS firmware
+  2.3.5.34). The K1 / K1C have not been tested. Differences from the Hi are wiring,
+  geometry and host behaviour, not protocol: the serial node is
   `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`, the toolhead switch is
-  `filament_sensor_2` on `nozzle_mcu:PA8`, and the cut/clean/extrude coordinates differ.
+  `filament_sensor_2` on `^!nozzle_mcu:PA10` and the cutter switch is on
+  `nozzle_mcu:PA8` (K1 Max), the cut/clean/extrude coordinates differ, and the stock
+  K1 Max host sends a shorter connect burst, polls 0x0A about every 4 s and sends no
+  idle 0x08. The `[creality_cfs]` options that select this behaviour are listed in
+  `configs/printer.cfg.example`; the K1 Max values are in `configs/cfs_k1max.cfg`.
 
 - **K2 Plus / K2 Max (X2000E), CAN:** a different system, "CFS-C". Same `0xF7`
   DataPackage, but marshalled into SocketCAN frames at 1 Mbit, with the cutter promoted

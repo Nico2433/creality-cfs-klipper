@@ -236,6 +236,34 @@ is calibrated with `CALIBRATE_CUT_POS`; that command does not exist in this modu
 Find your `cut_pos_x` by jogging X until the cutter lever bottoms out and the
 switch triggers, then set the values in `[creality_cfs]`.)
 
+### K1 Max: Y-ram cutter
+
+The K1 Max cuts along Y, not X. The toolhead moves to the pre-cut position
+(X38, Y230) and rams rearward to Y306 at 7000 mm/min. The cutter switch is on
+`nozzle_mcu:PA8`: it closes at about Y305 and is pressed at Y306. The
+toolhead filament switch is a separate input on `^!nozzle_mcu:PA10`.
+
+```ini
+[creality_cfs]
+cut_switch_pin: nozzle_mcu:PA8
+cut_switch_button: cfs_cut_switch   # CFS_CUT checks it reads PRESSED at Y306
+pre_cut_pos_x: 38
+pre_cut_pos_y: 230
+cut_pos_y: 306
+cut_velocity: 7000
+
+[gcode_button cfs_cut_switch]
+pin: nozzle_mcu:PA8
+press_gcode:
+  RESPOND MSG="CFS cut switch: pressed"
+```
+
+Do not set `cut_pos_x`. With `cut_pos_x` unset and `cut_pos_y` set, `CFS_CUT`
+rams along Y. The stock box.cfg lists `cut_pos_x` 38, the same as
+`pre_cut_pos_x`, and `CFS_CUT` refuses that as a zero-travel X ram.
+`[stepper_y] position_max` must be at least 306 (stock 307.5). These values
+are in `configs/cfs_k1max.cfg`.
+
 ---
 
 ## RS485 Transceiver Failure
@@ -297,6 +325,7 @@ sequence will run a fresh discovery and save the new UniID automatically.
 |------|----------------|-----|--------|
 | Creality Hi (GD32F303) | Mainboard /dev/ttyS5 | CFS v1 (1 box) | ✅ Confirmed |
 | Jetson Orin Nano (JetPack 6.2.2) | CH341 USB-RS485 dongle | CFS v1 (1 box) | ✅ Confirmed |
+| Creality K1 Max (plain Klipper) | Stock CH340 adapter, `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0` | Stock CFS, firmware 2.3.5.34, board CR4CU220812S11 (1 box) | ✅ Confirmed with `configs/cfs_k1max.cfg` |
 | BTT Octopus + Jetson Orin Nano | CH341 USB-RS485 dongle | CFS v1 | 🔵 In progress |
 
 ---

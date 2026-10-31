@@ -371,8 +371,22 @@ class TestMeltGuard:
 
 class TestPostLoadBufferRecheck:
 
+    def test_full_buffer_after_load_is_reported_by_default(self):
+        cfs, hw = _wired()
+        cfs._toolhead_filament_detected = _sequence_sensor([False, True])
+        cfs.get_buffer_state = mock.MagicMock(return_value={"code": 0x01, "state": "full"})
+        cfs.reactor.register_callback.reset_mock()
+        gcmd = _load_gcmd()
+
+        cfs.load_process(gcmd, 0x01, SLOT_T0)
+
+        infos = [c.args[0] for c in gcmd.respond_info.call_args_list]
+        assert any("post-load buffer reads full" in s for s in infos)    # upstream message
+        cfs.reactor.register_callback.assert_not_called()
+
     def test_full_buffer_after_load_defers_the_report(self):
         cfs, hw = _wired()
+        cfs.buffer_recheck_s = 7.
         cfs._toolhead_filament_detected = _sequence_sensor([False, True])
         cfs.get_buffer_state = mock.MagicMock(return_value={"code": 0x01, "state": "full"})
         cfs.reactor.register_callback.reset_mock()

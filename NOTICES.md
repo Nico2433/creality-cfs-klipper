@@ -16,7 +16,7 @@ The source was requested from Creality twice. As of 2026-06-06 it has not been p
 2. Protocol decode. The `0xF7` frame format, the CRC-8/SMBUS check (poly 0x07, init 0x00), the command set, and the dynamic addressing were derived from those captures and confirmed byte for byte.
 3. On-device open Python. `auto_addr_wrapper.py`, which Creality shipped as readable source in `CrealityOfficial/Hi_Klipper`, supplied the addressing handshake and timing. Running `strings` on the closed `.so` modules confirmed command names. Protocol values and timing constants are facts, not copyrightable expression.
 
-The transport, CRC, and addressing layers were validated against captures from physical Creality Hi hardware with a real CFS box. The load/unload/cut choreography was hardware-validated on the reference implementation this module ports from (same wire protocol, Creality Hi + CFS v1); this module's port of it is wire-faithful but has not yet been exercised on hardware itself. K1/K1C/K2 compatibility is untested: the K1-family firmware is a CAN build that remaps several function codes, so do not assume the RS485 map carries over.
+The transport, CRC, and addressing layers were validated against captures from physical Creality Hi hardware with a real CFS box. The load/unload/cut choreography was hardware-validated on the reference implementation this module ports from (same wire protocol, Creality Hi + CFS v1); this module's port of it is wire-faithful but has not yet been exercised on hardware itself. The K1 family speaks the same RS485 protocol; the K1 Max is hardware-tested (cfs_k1max.cfg), the K1 and K1C are untested. The K2 family uses CFS-C over CAN and is not supported.
 
 ## Provenance note
 
